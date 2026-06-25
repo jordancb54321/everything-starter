@@ -8,8 +8,8 @@ use std::{
 
 use chrono::Local;
 use eframe::egui::{
-    self, Align, Align2, CentralPanel, Color32, Context, FontId, Id, LayerId, Layout, Margin,
-    Order, Pos2, ProgressBar, Rect, RichText, Sense, Shape, Stroke, TextEdit, TopBottomPanel, Ui,
+    self, Align, Align2, CentralPanel, Color32, Context, FontId, Id, Layout, Margin, Pos2,
+    ProgressBar, Rect, RichText, Sense, Shape, Stroke, TextEdit, TopBottomPanel, Ui, UiBuilder,
     Vec2,
 };
 use serde::{Deserialize, Serialize};
@@ -21,12 +21,11 @@ const SETTINGS_FILE: &str = "settings.json";
 const POINTER_ANGLE: f32 = -std::f32::consts::FRAC_PI_2;
 const MAX_RECENT_CHORES: usize = 12;
 const SNAP_GRID_SIZE: f32 = 24.0;
-const SNAP_GRID_RANGE: f32 = 48.0;
-const SNAP_RELEASE_THRESHOLD: f32 = 12.0;
-const DASHBOARD_WINDOW_MARGIN: f32 = 14.0;
 const CHORES_PANEL_WIDTH: f32 = 420.0;
 const QUICK_ADD_PANEL_WIDTH: f32 = 380.0;
-const WINDOW_CHANGE_EPSILON_SQ: f32 = 1.0;
+const TILE_GAP: f32 = 8.0;
+const TILE_MARGIN: f32 = 10.0;
+const TILE_INNER_MARGIN: f32 = 10.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -156,6 +155,57 @@ struct WheelEntry<'a> {
     title: &'a str,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TileKind {
+    Tasks,
+    Wheel,
+    QuickAdd,
+    Progress,
+}
+
+impl TileKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Tasks => "Today's Tasks",
+            Self::Wheel => "Task Wheel",
+            Self::QuickAdd => "Quick Add",
+            Self::Progress => "Progress",
+        }
+    }
+
+    fn id_salt(self) -> &'static str {
+        match self {
+            Self::Tasks => "tasks_tile",
+            Self::Wheel => "wheel_tile",
+            Self::QuickAdd => "quick_add_tile",
+            Self::Progress => "progress_tile",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TileSpec {
+    kind: TileKind,
+    rect: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TileDensity {
+    compact: bool,
+    tight: bool,
+}
+
+impl TileDensity {
+    fn from_rect(rect: Rect) -> Self {
+        let width = rect.width();
+        let height = rect.height();
+        Self {
+            compact: width < 360.0 || height < 260.0,
+            tight: width < 290.0 || height < 190.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct DashboardWindows {
     #[serde(default = "default_true")]
@@ -209,22 +259,11 @@ struct StoredWindowRect {
 struct WindowRect {
     position: Pos2,
     size: Vec2,
-    snap_active: bool,
-    force_size_once: Option<Vec2>,
 }
 
 impl WindowRect {
     fn new(position: Pos2, size: Vec2) -> Self {
-        Self {
-            position,
-            size,
-            snap_active: false,
-            force_size_once: None,
-        }
-    }
-
-    fn request_size_once(&mut self) {
-        self.force_size_once = Some(self.size);
+        Self { position, size }
     }
 }
 
@@ -309,15 +348,6 @@ impl Default for AppSettings {
             layout: StoredDashboardLayout::default(),
             snap_to_grid: true,
         }
-    }
-}
-
-impl DashboardLayout {
-    fn request_sizes_once(&mut self) {
-        self.chores.request_size_once();
-        self.quick_add.request_size_once();
-        self.wheel.request_size_once();
-        self.progress.request_size_once();
     }
 }
 
@@ -748,7 +778,6 @@ impl ChoreApp {
             Ok(settings) => {
                 self.windows = settings.windows;
                 self.layout = settings.layout.into();
-                self.layout.request_sizes_once();
                 self.layout_dirty = false;
                 self.snap_to_grid = settings.snap_to_grid;
                 self.save_settings_state();
@@ -799,7 +828,7 @@ impl ChoreApp {
             ui.label(RichText::new(format!("{remaining} left")).color(accent_amber()));
 
             ui.add_space(18.0);
-            ui.label(RichText::new("Windows").color(text_secondary()));
+            ui.label(RichText::new("Tiles").color(text_secondary()));
             let mut settings_changed = false;
             settings_changed |= window_toggle(ui, &mut self.windows.chores, "Tasks");
             settings_changed |= window_toggle(ui, &mut self.windows.quick_add, "Quick Add");
@@ -808,32 +837,11 @@ impl ChoreApp {
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
-                    .add(egui::Button::new("Reset Layout").fill(control_fill()))
+                    .add(egui::Button::new("Reset Tiles").fill(control_fill()))
                     .clicked()
                 {
                     self.windows = DashboardWindows::default();
                     self.layout = DashboardLayout::default();
-                    self.layout.request_sizes_once();
-                    settings_changed = true;
-                }
-
-                let snap_label = if self.snap_to_grid {
-                    "Snap Grid: Soft"
-                } else {
-                    "Snap Grid: Off"
-                };
-                if ui
-                    .add(egui::Button::new(snap_label).fill(if self.snap_to_grid {
-                        accent_green()
-                    } else {
-                        control_fill()
-                    }))
-                    .on_hover_text(
-                        "Follows the mouse while dragging, then softly aligns near a 24px grid line",
-                    )
-                    .clicked()
-                {
-                    self.snap_to_grid = !self.snap_to_grid;
                     settings_changed = true;
                 }
 
@@ -866,198 +874,136 @@ impl ChoreApp {
         });
     }
 
-    fn show_dashboard_windows(&mut self, ctx: &Context) {
-        let (pointer_down, pointer_released) =
-            ctx.input(|input| (input.pointer.any_down(), input.pointer.any_released()));
+    fn show_tiled_dashboard(&mut self, ui: &mut Ui, ctx: &Context) {
+        let rect = ui.max_rect();
+        draw_workspace_background(ui, rect);
 
-        if self.windows.chores {
-            let mut open = self.windows.chores;
-            let force_size = self.layout.chores.force_size_once.take();
-            let mut window = egui::Window::new("Today's Tasks")
-                .id(Id::new("chores_window"))
-                .open(&mut open)
-                .current_pos(self.layout.chores.position)
-                .default_size(self.layout.chores.size)
-                .min_size(Vec2::new(330.0, 270.0))
-                .frame(dashboard_frame())
-                .collapsible(false)
-                .vscroll(true);
-            window = if let Some(size) = force_size {
-                window.fixed_size(size).resizable(true)
-            } else {
-                window.resizable(true)
-            };
-            let response = window.show(ctx, |ui| {
-                self.draw_chores_panel(ui, ctx);
+        let tiles = dashboard_tiles(self.windows, rect);
+        if tiles.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("No tiles open")
+                        .size(24.0)
+                        .strong()
+                        .color(text_secondary()),
+                );
             });
-            if update_window_rect(
-                ctx,
-                response.as_ref(),
-                &mut self.layout.chores,
-                self.snap_to_grid,
-                pointer_down,
-                pointer_released,
-            ) {
-                self.layout_dirty = true;
-            }
-            if self.windows.chores != open {
-                self.windows.chores = open;
-                self.save_settings_state();
-            } else {
-                self.windows.chores = open;
-            }
+            return;
         }
 
-        if self.windows.quick_add {
-            let mut open = self.windows.quick_add;
-            let force_size = self.layout.quick_add.force_size_once.take();
-            let mut window = egui::Window::new("Quick Add")
-                .id(Id::new("quick_add_window"))
-                .open(&mut open)
-                .current_pos(self.layout.quick_add.position)
-                .default_size(self.layout.quick_add.size)
-                .min_size(Vec2::new(310.0, 190.0))
-                .frame(dashboard_frame())
-                .collapsible(false)
-                .vscroll(true);
-            window = if let Some(size) = force_size {
-                window.fixed_size(size).resizable(true)
-            } else {
-                window.resizable(true)
-            };
-            let response = window.show(ctx, |ui| {
-                self.draw_quick_add_panel(ui);
-            });
-            if update_window_rect(
-                ctx,
-                response.as_ref(),
-                &mut self.layout.quick_add,
-                self.snap_to_grid,
-                pointer_down,
-                pointer_released,
-            ) {
-                self.layout_dirty = true;
-            }
-            if self.windows.quick_add != open {
-                self.windows.quick_add = open;
-                self.save_settings_state();
-            } else {
-                self.windows.quick_add = open;
-            }
-        }
-
-        if self.windows.wheel {
-            let mut open = self.windows.wheel;
-            let force_size = self.layout.wheel.force_size_once.take();
-            let mut window = egui::Window::new("Task Wheel")
-                .id(Id::new("wheel_window"))
-                .open(&mut open)
-                .current_pos(self.layout.wheel.position)
-                .default_size(self.layout.wheel.size)
-                .min_size(Vec2::new(430.0, 420.0))
-                .frame(dashboard_frame())
-                .collapsible(false);
-            window = if let Some(size) = force_size {
-                window.fixed_size(size).resizable(true)
-            } else {
-                window.resizable(true)
-            };
-            let response = window.show(ctx, |ui| {
-                self.draw_wheel_panel(ui, ctx);
-            });
-            if update_window_rect(
-                ctx,
-                response.as_ref(),
-                &mut self.layout.wheel,
-                self.snap_to_grid,
-                pointer_down,
-                pointer_released,
-            ) {
-                self.layout_dirty = true;
-            }
-            if self.windows.wheel != open {
-                self.windows.wheel = open;
-                self.save_settings_state();
-            } else {
-                self.windows.wheel = open;
-            }
-        }
-
-        if self.windows.progress {
-            let mut open = self.windows.progress;
-            let force_size = self.layout.progress.force_size_once.take();
-            let mut window = egui::Window::new("Progress")
-                .id(Id::new("progress_window"))
-                .open(&mut open)
-                .current_pos(self.layout.progress.position)
-                .default_size(self.layout.progress.size)
-                .min_size(Vec2::new(260.0, 220.0))
-                .frame(dashboard_frame())
-                .collapsible(false);
-            window = if let Some(size) = force_size {
-                window.fixed_size(size).resizable(true)
-            } else {
-                window.resizable(true)
-            };
-            let response = window.show(ctx, |ui| {
-                self.draw_progress_panel(ui);
-            });
-            if update_window_rect(
-                ctx,
-                response.as_ref(),
-                &mut self.layout.progress,
-                self.snap_to_grid,
-                pointer_down,
-                pointer_released,
-            ) {
-                self.layout_dirty = true;
-            }
-            if self.windows.progress != open {
-                self.windows.progress = open;
-                self.save_settings_state();
-            } else {
-                self.windows.progress = open;
-            }
-        }
-
-        if self.layout_dirty && !pointer_down {
-            self.save_settings_state();
-            self.layout_dirty = false;
+        for tile in tiles {
+            self.draw_dashboard_tile(ui, ctx, tile);
         }
     }
 
-    fn draw_chores_panel(&mut self, ui: &mut Ui, ctx: &Context) {
-        let content_width = bounded_panel_width(ui, CHORES_PANEL_WIDTH, 300.0);
+    fn draw_dashboard_tile(&mut self, ui: &mut Ui, ctx: &Context, tile: TileSpec) {
+        let density = TileDensity::from_rect(tile.rect);
+        let painter = ui.painter();
+        painter.rect_filled(tile.rect, 6.0, panel_fill());
+        painter.rect_stroke(tile.rect, 6.0, Stroke::new(1.0, border_color()));
 
-        ui.add_sized(
-            [content_width, 20.0],
-            egui::Label::new(RichText::new("Plan the tasks for today.").color(text_secondary()))
-                .truncate(),
+        let content_rect = tile.rect.shrink(TILE_INNER_MARGIN);
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .id_salt(tile.kind.id_salt())
+                .max_rect(content_rect)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                ui.set_clip_rect(tile.rect.shrink(1.0));
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(tile.kind.title())
+                            .strong()
+                            .color(text_primary()),
+                    );
+                    if density.compact {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new("Compact").color(text_secondary()));
+                        });
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt((tile.kind.id_salt(), "scroll"))
+                    .max_height(ui.available_height())
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match tile.kind {
+                        TileKind::Tasks => self.draw_chores_panel(ui, ctx, density),
+                        TileKind::Wheel => self.draw_wheel_panel(ui, ctx, density),
+                        TileKind::QuickAdd => self.draw_quick_add_panel(ui, density),
+                        TileKind::Progress => self.draw_progress_panel(ui, density),
+                    });
+            },
         );
-        ui.add_space(10.0);
+    }
 
-        ui.allocate_ui(Vec2::new(content_width, 30.0), |ui| {
-            ui.horizontal(|ui| {
-                let input_width = (content_width - 68.0).max(120.0);
+    fn draw_chores_panel(&mut self, ui: &mut Ui, ctx: &Context, density: TileDensity) {
+        let minimum_width = if density.tight {
+            170.0
+        } else if density.compact {
+            230.0
+        } else {
+            300.0
+        };
+        let content_width = bounded_panel_width(ui, CHORES_PANEL_WIDTH, minimum_width);
+
+        if !density.tight {
+            let header = if density.compact {
+                "Plan today."
+            } else {
+                "Plan the tasks for today."
+            };
+            ui.add_sized(
+                [content_width, 20.0],
+                egui::Label::new(RichText::new(header).color(text_secondary())).truncate(),
+            );
+            ui.add_space(10.0);
+        }
+
+        let input_height = if density.tight { 62.0 } else { 30.0 };
+        ui.allocate_ui(Vec2::new(content_width, input_height), |ui| {
+            if density.tight || content_width < 250.0 {
                 let response = ui.add_sized(
-                    [input_width, 28.0],
+                    [content_width, 28.0],
                     TextEdit::singleline(&mut self.new_chore)
                         .id(Id::new("new_chore_input"))
                         .hint_text("Add a task"),
                 );
-
                 let enter_pressed =
                     response.lost_focus() && ctx.input(|input| input.key_pressed(egui::Key::Enter));
                 let add_clicked = ui
-                    .add_sized([58.0, 28.0], egui::Button::new("Add").fill(accent_blue()))
+                    .add_sized(
+                        [content_width, 26.0],
+                        egui::Button::new("Add").fill(accent_blue()),
+                    )
                     .clicked();
                 if add_clicked || enter_pressed {
                     self.add_chore();
                 }
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    let input_width = (content_width - 68.0).max(120.0);
+                    let response = ui.add_sized(
+                        [input_width, 28.0],
+                        TextEdit::singleline(&mut self.new_chore)
+                            .id(Id::new("new_chore_input"))
+                            .hint_text("Add a task"),
+                    );
+
+                    let enter_pressed = response.lost_focus()
+                        && ctx.input(|input| input.key_pressed(egui::Key::Enter));
+                    let add_clicked = ui
+                        .add_sized([58.0, 28.0], egui::Button::new("Add").fill(accent_blue()))
+                        .clicked();
+                    if add_clicked || enter_pressed {
+                        self.add_chore();
+                    }
+                });
+            }
         });
 
-        ui.add_space(14.0);
+        ui.add_space(if density.tight { 8.0 } else { 14.0 });
 
         let mut toggle: Option<(u64, bool)> = None;
         let mut remove: Option<u64> = None;
@@ -1092,14 +1038,15 @@ impl ChoreApp {
                                 RichText::new(fit_row_label(&chore.title)).color(text_primary())
                             };
 
-                            let remove_width = 76.0;
+                            let remove_width = if density.compact { 34.0 } else { 76.0 };
+                            let remove_label = if density.compact { "X" } else { "Remove" };
                             let title_width = (row_width - remove_width - 42.0).clamp(96.0, 340.0);
                             ui.vertical(|ui| {
                                 ui.add_sized(
                                     [title_width, 20.0],
                                     egui::Label::new(title).truncate(),
                                 );
-                                if chore.picked_count > 0 {
+                                if chore.picked_count > 0 && !density.tight {
                                     ui.add_sized(
                                         [title_width, 16.0],
                                         egui::Label::new(
@@ -1119,7 +1066,7 @@ impl ChoreApp {
                             if ui
                                 .add_sized(
                                     [remove_width, 26.0],
-                                    egui::Button::new("Remove").fill(control_fill()),
+                                    egui::Button::new(remove_label).fill(control_fill()),
                                 )
                                 .clicked()
                             {
@@ -1145,11 +1092,16 @@ impl ChoreApp {
         ui.add_space(6.0);
         ui.allocate_ui(Vec2::new(content_width, 30.0), |ui| {
             ui.horizontal(|ui| {
-                let clear_width = 104.0;
+                let clear_width = if density.compact { 68.0 } else { 104.0 };
+                let clear_label = if density.compact {
+                    "Clear"
+                } else {
+                    "Clear Finished"
+                };
                 if ui
                     .add_sized(
                         [clear_width, 26.0],
-                        egui::Button::new("Clear Finished").fill(control_fill()),
+                        egui::Button::new(clear_label).fill(control_fill()),
                     )
                     .clicked()
                 {
@@ -1157,7 +1109,7 @@ impl ChoreApp {
                 }
 
                 let count_text = format!("{} task(s)", self.today_plan().chores.len());
-                let count_width = 82.0;
+                let count_width = if density.compact { 70.0 } else { 82.0 };
                 let spacer = (content_width - clear_width - count_width - 8.0).max(0.0);
                 ui.add_space(spacer);
                 ui.add_sized(
@@ -1168,8 +1120,15 @@ impl ChoreApp {
         });
     }
 
-    fn draw_quick_add_panel(&mut self, ui: &mut Ui) {
-        let content_width = bounded_panel_width(ui, QUICK_ADD_PANEL_WIDTH, 280.0);
+    fn draw_quick_add_panel(&mut self, ui: &mut Ui, density: TileDensity) {
+        let minimum_width = if density.tight {
+            170.0
+        } else if density.compact {
+            230.0
+        } else {
+            280.0
+        };
+        let content_width = bounded_panel_width(ui, QUICK_ADD_PANEL_WIDTH, minimum_width);
         let mut quick_add = None;
         let mut clear_history = false;
 
@@ -1186,14 +1145,17 @@ impl ChoreApp {
 
             ui.allocate_ui(Vec2::new(content_width, 30.0), |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [content_width - 118.0, 20.0],
-                        egui::Label::new(RichText::new("Recent tasks").color(text_secondary()))
-                            .truncate(),
-                    );
+                    if !density.tight {
+                        ui.add_sized(
+                            [content_width - 118.0, 20.0],
+                            egui::Label::new(RichText::new("Recent tasks").color(text_secondary()))
+                                .truncate(),
+                        );
+                    }
+                    let clear_width = if density.tight { 92.0 } else { 108.0 };
                     if ui
                         .add_sized(
-                            [108.0, 26.0],
+                            [clear_width, 26.0],
                             egui::Button::new("Clear History").fill(control_fill()),
                         )
                         .clicked()
@@ -1217,20 +1179,28 @@ impl ChoreApp {
                                     .strong()
                                     .color(text_primary()),
                             );
-                            ui.small(
-                                RichText::new(format!(
-                                    "{} time(s), last {}",
-                                    chore.added_count, chore.last_added_at
-                                ))
-                                .color(text_secondary()),
-                            );
+                            if !density.tight {
+                                let detail = if density.compact {
+                                    format!("{} time(s)", chore.added_count)
+                                } else {
+                                    format!(
+                                        "{} time(s), last {}",
+                                        chore.added_count, chore.last_added_at
+                                    )
+                                };
+                                ui.small(RichText::new(detail).color(text_secondary()));
+                            }
                         });
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if already_today {
-                                ui.label(RichText::new("In today").color(accent_green()));
+                                let label = if density.tight { "In" } else { "In today" };
+                                ui.label(RichText::new(label).color(accent_green()));
                             } else if ui
-                                .add(egui::Button::new("Add").fill(accent_blue()))
+                                .add(
+                                    egui::Button::new(if density.tight { "+" } else { "Add" })
+                                        .fill(accent_blue()),
+                                )
                                 .on_hover_text(format!("Quick add {}", chore.title))
                                 .clicked()
                             {
@@ -1255,7 +1225,7 @@ impl ChoreApp {
         }
     }
 
-    fn draw_wheel_panel(&mut self, ui: &mut Ui, ctx: &Context) {
+    fn draw_wheel_panel(&mut self, ui: &mut Ui, ctx: &Context, density: TileDensity) {
         let incomplete_count = self
             .today_plan()
             .chores
@@ -1274,7 +1244,9 @@ impl ChoreApp {
 
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("Next task selector").color(text_secondary()));
+                if !density.tight {
+                    ui.label(RichText::new("Next task selector").color(text_secondary()));
+                }
                 ui.label(
                     RichText::new(&self.status_message)
                         .strong()
@@ -1284,6 +1256,8 @@ impl ChoreApp {
 
             let spin_label = if self.spin.is_some() {
                 "Spinning..."
+            } else if density.compact {
+                "Spin"
             } else {
                 "Spin Wheel"
             };
@@ -1319,14 +1293,28 @@ impl ChoreApp {
             });
         });
 
-        ui.add_space(16.0);
+        ui.add_space(if density.compact { 8.0 } else { 16.0 });
 
         let entries = self.incomplete_entries();
         let available = ui.available_size();
+        let min_wheel_size = if density.tight {
+            96.0
+        } else if density.compact {
+            150.0
+        } else {
+            210.0
+        };
+        let reserved_height = if density.tight {
+            34.0
+        } else if density.compact {
+            50.0
+        } else {
+            72.0
+        };
         let wheel_size = available
             .x
-            .min((available.y - 72.0).max(210.0))
-            .clamp(210.0, 560.0);
+            .min((available.y - reserved_height).max(min_wheel_size))
+            .clamp(min_wheel_size, 560.0);
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(wheel_size), Sense::hover());
         draw_wheel(
             ui,
@@ -1336,41 +1324,43 @@ impl ChoreApp {
             self.selected_chore_id,
         );
 
-        ui.add_space(10.0);
+        ui.add_space(if density.compact { 6.0 } else { 10.0 });
 
         ui.vertical_centered(|ui| {
             if let Some(title) = self.selected_chore_title() {
                 ui.label(
                     RichText::new(title)
-                        .size(24.0)
+                        .size(if density.compact { 18.0 } else { 24.0 })
                         .strong()
                         .color(text_primary()),
                 );
             } else if entries.is_empty() {
                 ui.label(
                     RichText::new("All tasks are done.")
-                        .size(22.0)
+                        .size(if density.compact { 17.0 } else { 22.0 })
                         .strong()
                         .color(accent_green()),
                 );
-            } else if entries.len() == 1 {
+            } else if entries.len() == 1 && !density.tight {
                 ui.label(
                     RichText::new("Mark this task done when finished.").color(text_secondary()),
                 );
-            } else {
+            } else if !density.tight {
                 ui.label(RichText::new("Spin to choose your next task.").color(text_secondary()));
             }
 
-            if let Some(error) = &self.save_error {
-                ui.colored_label(accent_red(), format!("Save error: {error}"));
-            }
-            if let Some(error) = &self.settings_error {
-                ui.colored_label(accent_red(), format!("Settings error: {error}"));
+            if !density.tight {
+                if let Some(error) = &self.save_error {
+                    ui.colored_label(accent_red(), format!("Save error: {error}"));
+                }
+                if let Some(error) = &self.settings_error {
+                    ui.colored_label(accent_red(), format!("Settings error: {error}"));
+                }
             }
         });
     }
 
-    fn draw_progress_panel(&self, ui: &mut Ui) {
+    fn draw_progress_panel(&self, ui: &mut Ui, density: TileDensity) {
         let (total, done, remaining) = self.chore_counts();
         let completion = if total == 0 {
             0.0
@@ -1378,14 +1368,16 @@ impl ChoreApp {
             done as f32 / total as f32
         };
 
-        ui.label(RichText::new("Today's progress").color(text_secondary()));
+        if !density.tight {
+            ui.label(RichText::new("Today's progress").color(text_secondary()));
+        }
         ui.add_space(8.0);
         ui.add(
             ProgressBar::new(completion)
                 .fill(accent_green())
                 .text(format!("{}%", (completion * 100.0).round() as u32)),
         );
-        ui.add_space(12.0);
+        ui.add_space(if density.compact { 8.0 } else { 12.0 });
 
         egui::Grid::new("progress_stats")
             .num_columns(2)
@@ -1399,7 +1391,11 @@ impl ChoreApp {
                 ui.end_row();
             });
 
-        ui.add_space(14.0);
+        ui.add_space(if density.compact { 8.0 } else { 14.0 });
+
+        if density.tight {
+            return;
+        }
 
         if let Some(title) = self.selected_chore_title() {
             ui.label(RichText::new("Selected").color(text_secondary()));
@@ -1430,15 +1426,12 @@ impl eframe::App for ChoreApp {
         CentralPanel::default()
             .frame(egui::Frame::none().fill(workspace_fill()))
             .show(ctx, |ui| {
-                draw_workspace(ui, self.windows);
+                self.show_tiled_dashboard(ui, ctx);
             });
-
-        self.show_dashboard_windows(ctx);
     }
 }
 
-fn draw_workspace(ui: &mut Ui, windows: DashboardWindows) {
-    let rect = ui.max_rect();
+fn draw_workspace_background(ui: &mut Ui, rect: Rect) {
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, workspace_fill());
 
@@ -1456,17 +1449,112 @@ fn draw_workspace(ui: &mut Ui, windows: DashboardWindows) {
         y += SNAP_GRID_SIZE;
     }
     painter.extend(grid_dots);
+}
 
-    if !windows.chores && !windows.quick_add && !windows.wheel && !windows.progress {
-        ui.centered_and_justified(|ui| {
-            ui.label(
-                RichText::new("No modules open")
-                    .size(24.0)
-                    .strong()
-                    .color(text_secondary()),
-            );
-        });
+fn dashboard_tiles(windows: DashboardWindows, workspace_rect: Rect) -> Vec<TileSpec> {
+    let kinds = visible_tile_kinds(windows);
+    if kinds.is_empty() {
+        return Vec::new();
     }
+
+    let rect = workspace_rect.shrink(TILE_MARGIN);
+    let rects = tile_rects(rect, kinds.len());
+    kinds
+        .into_iter()
+        .zip(rects)
+        .map(|(kind, rect)| TileSpec { kind, rect })
+        .collect()
+}
+
+fn visible_tile_kinds(windows: DashboardWindows) -> Vec<TileKind> {
+    let mut kinds = Vec::with_capacity(4);
+    if windows.chores {
+        kinds.push(TileKind::Tasks);
+    }
+    if windows.wheel {
+        kinds.push(TileKind::Wheel);
+    }
+    if windows.quick_add {
+        kinds.push(TileKind::QuickAdd);
+    }
+    if windows.progress {
+        kinds.push(TileKind::Progress);
+    }
+    kinds
+}
+
+fn tile_rects(rect: Rect, count: usize) -> Vec<Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    if count == 1 {
+        return vec![rect];
+    }
+
+    if rect.width() < 620.0 {
+        return stacked_rows(rect, count, TILE_GAP);
+    }
+
+    match count {
+        2 => {
+            if rect.width() >= rect.height() {
+                let (left, right) = split_columns(rect, 0.56, TILE_GAP);
+                vec![left, right]
+            } else {
+                let (top, bottom) = split_rows(rect, 0.56, TILE_GAP);
+                vec![top, bottom]
+            }
+        }
+        3 => {
+            if rect.width() >= rect.height() {
+                let (master, stack) = split_columns(rect, 0.52, TILE_GAP);
+                let (top, bottom) = split_rows(stack, 0.5, TILE_GAP);
+                vec![master, top, bottom]
+            } else {
+                let (master, stack) = split_rows(rect, 0.5, TILE_GAP);
+                let (left, right) = split_columns(stack, 0.5, TILE_GAP);
+                vec![master, left, right]
+            }
+        }
+        4 => {
+            let (left_column, right_column) = split_columns(rect, 0.43, TILE_GAP);
+            let (left_top, left_bottom) = split_rows(left_column, 0.66, TILE_GAP);
+            let (right_top, right_bottom) = split_rows(right_column, 0.66, TILE_GAP);
+            vec![left_top, right_top, left_bottom, right_bottom]
+        }
+        _ => stacked_rows(rect, count, TILE_GAP),
+    }
+}
+
+fn split_columns(rect: Rect, left_fraction: f32, gap: f32) -> (Rect, Rect) {
+    let usable_width = (rect.width() - gap).max(0.0);
+    let left_width = usable_width * left_fraction.clamp(0.1, 0.9);
+    let left = Rect::from_min_max(rect.min, Pos2::new(rect.left() + left_width, rect.bottom()));
+    let right = Rect::from_min_max(Pos2::new(left.right() + gap, rect.top()), rect.max);
+    (left, right)
+}
+
+fn split_rows(rect: Rect, top_fraction: f32, gap: f32) -> (Rect, Rect) {
+    let usable_height = (rect.height() - gap).max(0.0);
+    let top_height = usable_height * top_fraction.clamp(0.1, 0.9);
+    let top = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + top_height));
+    let bottom = Rect::from_min_max(Pos2::new(rect.left(), top.bottom() + gap), rect.max);
+    (top, bottom)
+}
+
+fn stacked_rows(rect: Rect, count: usize, gap: f32) -> Vec<Rect> {
+    let total_gap = gap * count.saturating_sub(1) as f32;
+    let row_height = ((rect.height() - total_gap) / count as f32).max(0.0);
+    (0..count)
+        .map(|index| {
+            let top = rect.top() + index as f32 * (row_height + gap);
+            Rect::from_min_max(
+                Pos2::new(rect.left(), top),
+                Pos2::new(rect.right(), top + row_height),
+            )
+        })
+        .collect()
 }
 
 fn configure_dark_style(ctx: &Context) {
@@ -1505,133 +1593,6 @@ fn window_toggle(ui: &mut Ui, open: &mut bool, label: &str) -> bool {
     }
 }
 
-fn update_window_rect(
-    ctx: &Context,
-    response: Option<&egui::InnerResponse<Option<()>>>,
-    window_rect: &mut WindowRect,
-    snap_to_grid: bool,
-    pointer_down: bool,
-    pointer_released: bool,
-) -> bool {
-    if let Some(response) = response {
-        let old_position = window_rect.position;
-        let old_size = window_rect.size;
-        let rect = response.response.rect;
-        let current_size = outer_to_inner_window_size(ctx, rect.size());
-        let rect_changed =
-            window_rect_delta_sq(window_rect, rect.min, current_size) > WINDOW_CHANGE_EPSILON_SQ;
-
-        if snap_to_grid && pointer_down {
-            if response.response.dragged() || rect_changed {
-                window_rect.snap_active = true;
-                draw_snap_preview(ctx, rect);
-            }
-
-            window_rect.position = rect.min;
-            window_rect.size = current_size;
-        } else if snap_to_grid && pointer_released && window_rect.snap_active {
-            let snapped_rect = release_snap_rect(rect);
-            window_rect.position = snapped_rect.min;
-            window_rect.size = outer_to_inner_window_size(ctx, snapped_rect.size());
-            window_rect.snap_active = false;
-            if !rect_nearly_equal(rect, snapped_rect) {
-                window_rect.request_size_once();
-            }
-        } else {
-            window_rect.position = rect.min;
-            window_rect.size = current_size;
-            if pointer_released {
-                window_rect.snap_active = false;
-            }
-        }
-
-        let position_delta = old_position - window_rect.position;
-        let size_delta = old_size - window_rect.size;
-        position_delta.length_sq() + size_delta.length_sq() > WINDOW_CHANGE_EPSILON_SQ
-    } else {
-        false
-    }
-}
-
-fn draw_snap_preview(ctx: &Context, rect: Rect) {
-    let preview_rect = magnetic_rect(rect);
-    let position_delta = preview_rect.min - rect.min;
-    let size_delta = preview_rect.size() - rect.size();
-    if position_delta.length_sq() + size_delta.length_sq() < 0.5 {
-        return;
-    }
-
-    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("snap_preview")));
-    painter.rect_filled(
-        preview_rect,
-        8.0,
-        Color32::from_rgba_unmultiplied(37, 99, 235, 18),
-    );
-    painter.rect_stroke(
-        preview_rect,
-        8.0,
-        Stroke::new(1.5, Color32::from_rgba_unmultiplied(96, 165, 250, 190)),
-    );
-    painter.line_segment(
-        [rect.center(), preview_rect.center()],
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(96, 165, 250, 120)),
-    );
-}
-
-fn magnetic_rect(rect: Rect) -> Rect {
-    Rect::from_min_size(magnetic_position(rect.min), magnetic_size(rect.size()))
-}
-
-fn magnetic_position(position: Pos2) -> Pos2 {
-    Pos2::new(magnetic_axis(position.x), magnetic_axis(position.y))
-}
-
-fn magnetic_size(size: Vec2) -> Vec2 {
-    Vec2::new(magnetic_axis(size.x), magnetic_axis(size.y))
-}
-
-fn magnetic_axis(value: f32) -> f32 {
-    let snapped = nearest_grid_line(value);
-    let distance = snapped - value;
-    let absolute_distance = distance.abs();
-
-    if absolute_distance > SNAP_GRID_RANGE {
-        return value;
-    }
-
-    let closeness = 1.0 - (absolute_distance / SNAP_GRID_RANGE);
-    let strength = closeness * closeness;
-    value + distance * strength * 0.72
-}
-
-fn release_snap_position(position: Pos2) -> Pos2 {
-    Pos2::new(release_snap_axis(position.x), release_snap_axis(position.y))
-}
-
-fn release_snap_size(size: Vec2) -> Vec2 {
-    Vec2::new(release_snap_axis(size.x), release_snap_axis(size.y))
-}
-
-fn release_snap_rect(rect: Rect) -> Rect {
-    Rect::from_min_size(
-        release_snap_position(rect.min),
-        release_snap_size(rect.size()),
-    )
-}
-
-fn release_snap_axis(value: f32) -> f32 {
-    let snapped = nearest_grid_line(value);
-    if (snapped - value).abs() <= SNAP_RELEASE_THRESHOLD {
-        snapped
-    } else {
-        value
-    }
-}
-
-fn nearest_grid_line(value: f32) -> f32 {
-    (value / SNAP_GRID_SIZE).round() * SNAP_GRID_SIZE
-}
-
 fn bounded_panel_width(ui: &Ui, preferred: f32, minimum: f32) -> f32 {
     let available = ui.available_width();
     let minimum = minimum.min(preferred);
@@ -1641,38 +1602,6 @@ fn bounded_panel_width(ui: &Ui, preferred: f32, minimum: f32) -> f32 {
     } else {
         preferred
     }
-}
-
-fn window_rect_delta_sq(window_rect: &WindowRect, position: Pos2, size: Vec2) -> f32 {
-    let position_delta = window_rect.position - position;
-    let size_delta = window_rect.size - size;
-    position_delta.length_sq() + size_delta.length_sq()
-}
-
-fn outer_to_inner_window_size(ctx: &Context, outer_size: Vec2) -> Vec2 {
-    let title_font = egui::TextStyle::Heading.resolve(&ctx.style());
-    let title_height = ctx.fonts(|fonts| fonts.row_height(&title_font));
-    let horizontal_chrome = DASHBOARD_WINDOW_MARGIN * 2.0;
-    let vertical_chrome = DASHBOARD_WINDOW_MARGIN * 4.0 + title_height;
-
-    Vec2::new(
-        (outer_size.x - horizontal_chrome).max(96.0),
-        (outer_size.y - vertical_chrome).max(32.0),
-    )
-}
-
-fn rect_nearly_equal(left: Rect, right: Rect) -> bool {
-    let position_delta = left.min - right.min;
-    let size_delta = left.size() - right.size();
-    position_delta.length_sq() + size_delta.length_sq() < 0.5
-}
-
-fn dashboard_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(panel_fill())
-        .stroke(Stroke::new(1.0, border_color()))
-        .rounding(8.0)
-        .inner_margin(Margin::same(DASHBOARD_WINDOW_MARGIN))
 }
 
 fn chore_row_frame(selected: bool, subdued: bool) -> egui::Frame {
