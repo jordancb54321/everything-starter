@@ -39,7 +39,7 @@ jobs:
         run: cargo build --locked --release --verbose
 
       - name: Upload Windows executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: everything-starter-windows-x86_64
           path: target/release/everything-starter.exe
