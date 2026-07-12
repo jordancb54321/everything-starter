@@ -10,6 +10,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
@@ -27,10 +30,17 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
       - name: Build release
-        run: cargo build --release --verbose
+        run: cargo build --locked --release --verbose
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: everything-starter-windows-x86_64
+          path: target/release/everything-starter.exe
+          if-no-files-found: error
