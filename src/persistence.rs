@@ -12,7 +12,7 @@ use serde::Serialize;
 use tempfile::NamedTempFile;
 
 use crate::dashboard::AppSettings;
-use crate::model::AppData;
+use crate::model::{APP_DATA_VERSION, AppData};
 
 const STORAGE_FOLDER: &str = "EverythingStarter";
 const STORAGE_FILE: &str = "chores.json";
@@ -66,7 +66,13 @@ pub(crate) fn path_label(path: &Path) -> String {
 }
 
 pub(crate) fn prepare_imported_data(mut data: AppData, today: &str) -> Result<AppData, String> {
-    data.version = data.version.max(2);
+    if data.version > APP_DATA_VERSION {
+        return Err(format!(
+            "unsupported task data version {}; this app supports up to version {APP_DATA_VERSION}",
+            data.version
+        ));
+    }
+    data.version = APP_DATA_VERSION;
     let mut dates = HashSet::new();
     let mut ids = HashSet::new();
     let mut max_id = 0;
@@ -99,10 +105,14 @@ pub(crate) fn prepare_imported_data(mut data: AppData, today: &str) -> Result<Ap
         max_id = max_id.max(task.id);
     }
 
-    data.next_id = max_id
+    let next_id = max_id
         .checked_add(1)
         .ok_or_else(|| "task ID range is exhausted".to_owned())?
         .max(1);
+    if next_id == u64::MAX {
+        return Err("task ID range is exhausted".to_owned());
+    }
+    data.next_id = next_id;
     data.ensure_day(today);
 
     Ok(data)
@@ -249,7 +259,7 @@ mod tests {
         let data = AppData {
             days: vec![DayPlan {
                 date: "2026-07-12".to_owned(),
-                chores: vec![chore(u64::MAX, "Last possible ID")],
+                chores: vec![chore(u64::MAX - 1, "No safe successor ID")],
             }],
             ..AppData::default()
         };
@@ -258,6 +268,19 @@ mod tests {
             .expect_err("an exhausted ID range must be rejected");
 
         assert!(error.contains("ID range is exhausted"));
+    }
+
+    #[test]
+    fn imported_data_rejects_unsupported_future_versions() {
+        let data = AppData {
+            version: 3,
+            ..AppData::default()
+        };
+
+        let error = prepare_imported_data(data, "2026-07-12")
+            .expect_err("future data versions must be rejected");
+
+        assert!(error.contains("unsupported task data version 3"));
     }
 
     #[test]

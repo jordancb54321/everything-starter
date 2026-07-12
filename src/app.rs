@@ -68,6 +68,7 @@ struct ChoreApp {
     storage_path: PathBuf,
     settings_path: PathBuf,
     data_save_enabled: bool,
+    settings_save_enabled: bool,
     today: String,
     new_chore: String,
     new_recurring_task: String,
@@ -122,12 +123,14 @@ impl ChoreApp {
                 )
             }
         };
-        let (settings, settings_error) = match load_settings(&settings_path) {
-            Ok(settings) => (settings, None),
+        let (settings, settings_save_enabled, settings_error) = match load_settings(&settings_path)
+        {
+            Ok(settings) => (settings, true, None),
             Err(error) => (
                 AppSettings::default(),
+                false,
                 Some(format!(
-                    "Could not load dashboard settings from {}: {error}",
+                    "Could not load dashboard settings from {}. Saving is disabled to avoid overwriting it: {error}",
                     settings_path.display()
                 )),
             ),
@@ -162,6 +165,7 @@ impl ChoreApp {
             storage_path,
             settings_path,
             data_save_enabled,
+            settings_save_enabled,
             today,
             new_chore: String::new(),
             new_recurring_task: String::new(),
@@ -230,8 +234,11 @@ impl ChoreApp {
             return false;
         }
 
-        let id = self.data.next_id;
-        self.data.next_id += 1;
+        let Some(id) = self.data.take_next_id() else {
+            self.status_message =
+                "Cannot add another task because the ID range is exhausted.".to_owned();
+            return false;
+        };
 
         let chore = Chore {
             id,
@@ -295,6 +302,16 @@ impl ChoreApp {
     }
 
     fn save_settings_state(&mut self) {
+        if !self.settings_save_enabled {
+            if self.settings_error.is_none() {
+                self.settings_error = Some(
+                    "Dashboard settings saving is disabled because the existing settings file did not load."
+                        .to_owned(),
+                );
+            }
+            return;
+        }
+
         match save_settings(&self.settings_path, &self.current_settings()) {
             Ok(()) => self.settings_error = None,
             Err(error) => self.settings_error = Some(error.to_string()),
@@ -754,8 +771,13 @@ impl ChoreApp {
 
         let available_after_days = self.recurring_available_after_days;
         let due_after_days = self.recurring_due_after_days.max(available_after_days);
+        let Some(id) = self.data.take_next_id() else {
+            self.status_message =
+                "Cannot add another recurring task because the ID range is exhausted.".to_owned();
+            return;
+        };
         let task = RecurringTask {
-            id: self.data.next_id,
+            id,
             title: title.clone(),
             available_after_days,
             due_after_days,
@@ -766,7 +788,6 @@ impl ChoreApp {
             picked_count: 0,
         };
         self.cancel_spin_for_chore_change();
-        self.data.next_id = self.data.next_id.saturating_add(1);
         self.data.recurring_tasks.push(task);
         self.new_recurring_task.clear();
         self.recurring_due_after_days = due_after_days;
@@ -831,7 +852,6 @@ impl ChoreApp {
 
         match save_data(&path, &self.data) {
             Ok(()) => {
-                self.save_error = None;
                 self.status_message = format!("Tasks exported to {}.", path_label(&path));
             }
             Err(error) => {
@@ -892,7 +912,6 @@ impl ChoreApp {
 
         match save_settings(&path, &self.current_settings()) {
             Ok(()) => {
-                self.settings_error = None;
                 self.status_message = format!("Layout exported to {}.", path_label(&path));
             }
             Err(error) => {
@@ -911,6 +930,7 @@ impl ChoreApp {
 
         match load_settings(&path) {
             Ok(settings) => {
+                self.settings_save_enabled = true;
                 let mut windows = settings.windows;
                 let mut layout: DashboardLayout = settings.layout.into();
                 self.task_panel_mode = merge_legacy_recurring_window(

@@ -2,6 +2,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 
 const MAX_RECENT_CHORES: usize = 12;
+pub(crate) const APP_DATA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Chore {
@@ -53,7 +54,7 @@ pub(crate) struct AppData {
 impl Default for AppData {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: APP_DATA_VERSION,
             next_id: 1,
             days: Vec::new(),
             recent_chores: Vec::new(),
@@ -63,6 +64,12 @@ impl Default for AppData {
 }
 
 impl AppData {
+    pub(crate) fn take_next_id(&mut self) -> Option<u64> {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1)?;
+        Some(id)
+    }
+
     pub(crate) fn ensure_day(&mut self, date: &str) {
         if !self.days.iter().any(|day| day.date == date) {
             self.days.push(DayPlan {
@@ -142,4 +149,21 @@ pub(crate) fn same_chore_title(left: &str, right: &str) -> bool {
 
 pub(crate) fn timestamp_string() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_id_allocation_stops_before_overflow() {
+        let mut data = AppData {
+            next_id: u64::MAX - 1,
+            ..AppData::default()
+        };
+
+        assert_eq!(data.take_next_id(), Some(u64::MAX - 1));
+        assert_eq!(data.take_next_id(), None);
+        assert_eq!(data.next_id, u64::MAX);
+    }
 }
