@@ -65,7 +65,25 @@ pub(crate) fn path_label(path: &Path) -> String {
         .map_or_else(|| path.display().to_string(), ToOwned::to_owned)
 }
 
+fn canonical_date(value: &str) -> bool {
+    value.len() == 10
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index == 4 || index == 7 {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+        && NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .is_ok_and(|date| date.format("%Y-%m-%d").to_string() == value)
+}
+
 pub(crate) fn prepare_imported_data(mut data: AppData, today: &str) -> Result<AppData, String> {
+    if !canonical_date(today) {
+        return Err(format!(
+            "invalid current day date (expected YYYY-MM-DD): {today}"
+        ));
+    }
     if data.version > APP_DATA_VERSION {
         return Err(format!(
             "unsupported task data version {}; this app supports up to version {APP_DATA_VERSION}",
@@ -78,8 +96,11 @@ pub(crate) fn prepare_imported_data(mut data: AppData, today: &str) -> Result<Ap
     let mut max_id = 0;
 
     for day in &data.days {
-        if NaiveDate::parse_from_str(&day.date, "%Y-%m-%d").is_err() {
-            return Err(format!("invalid day date: {}", day.date));
+        if !canonical_date(&day.date) {
+            return Err(format!(
+                "invalid day date (expected YYYY-MM-DD): {}",
+                day.date
+            ));
         }
         if !dates.insert(day.date.as_str()) {
             return Err(format!("duplicate day date: {}", day.date));
@@ -93,9 +114,9 @@ pub(crate) fn prepare_imported_data(mut data: AppData, today: &str) -> Result<Ap
     }
 
     for task in &data.recurring_tasks {
-        if NaiveDate::parse_from_str(&task.cycle_started_on, "%Y-%m-%d").is_err() {
+        if !canonical_date(&task.cycle_started_on) {
             return Err(format!(
-                "invalid recurring-task cycle date: {}",
+                "invalid recurring-task cycle date (expected YYYY-MM-DD): {}",
                 task.cycle_started_on
             ));
         }
@@ -186,6 +207,54 @@ pub(crate) fn load_settings(path: &PathBuf) -> io::Result<AppSettings> {
     }
 }
 
+pub(crate) fn load_import_data(path: &Path) -> io::Result<AppData> {
+    serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn load_import_settings(path: &Path) -> io::Result<AppSettings> {
+    serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+// Keep each pre-import file verbatim, including unreadable JSON from recovery mode.
+pub(crate) fn backup_before_import<T: Serialize>(path: &Path, current: &T) -> io::Result<PathBuf> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            serde_json::to_vec_pretty(current).map_err(io::Error::other)?
+        }
+        Err(error) => return Err(error),
+    };
+    let backup_path = write_import_backup(path, &bytes, "")?;
+    let current_bytes = serde_json::to_vec_pretty(current).map_err(io::Error::other)?;
+    if serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+        != Some(serde_json::to_value(current).map_err(io::Error::other)?)
+    {
+        write_import_backup(path, &current_bytes, "current-")?;
+    }
+    Ok(backup_path)
+}
+
+fn write_import_backup(path: &Path, bytes: &[u8], snapshot: &str) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let prefix = format!("{}.pre-import-{snapshot}", path_label(path));
+    let mut backup = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".bak")
+        .tempfile_in(parent)?;
+    backup.write_all(bytes)?;
+    backup.as_file().sync_all()?;
+    let (_, backup_path) = backup.keep().map_err(|error| error.error)?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(backup_path)
+}
+
 pub(crate) fn save_data(path: &Path, data: &AppData) -> io::Result<()> {
     save_json(path, data)
 }
@@ -238,6 +307,109 @@ mod tests {
     }
 
     #[test]
+    fn canonical_dates_reject_signed_or_expanded_years() {
+        for value in [
+            "+10000-01-01",
+            "-0001-01-01",
+            "+2026-11-05",
+            "２０２６-11-05",
+        ] {
+            assert!(
+                !canonical_date(value),
+                "accepted non-YYYY-MM-DD date: {value}"
+            );
+            assert!(prepare_imported_data(AppData::default(), value).is_err());
+            let data = AppData {
+                days: vec![DayPlan {
+                    date: value.into(),
+                    chores: vec![],
+                }],
+                ..AppData::default()
+            };
+            assert!(prepare_imported_data(data, "2026-11-05").is_err());
+        }
+        assert!(canonical_date("2026-11-05"));
+        assert!(canonical_date("2024-02-29"));
+        assert!(!canonical_date("2026-02-29"));
+    }
+
+    #[test]
+    fn failed_current_snapshot_aborts_backup_even_after_disk_backup_succeeds() {
+        struct Unserializable;
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("current snapshot failed"))
+            }
+        }
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("tasks.json");
+        fs::write(&path, b"broken original JSON").unwrap();
+        let result = backup_before_import(&path, &Unserializable);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("current snapshot failed")
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"broken original JSON");
+        let backups: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("pre-import-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(backups[0].path()).unwrap(),
+            b"broken original JSON"
+        );
+    }
+
+    #[test]
+    fn importing_a_missing_destination_still_backs_up_current_data() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("tasks.json");
+        let mut current = AppData::default();
+        current.ensure_day("2026-11-05");
+        let backup = backup_before_import(&path, &current).unwrap();
+        assert!(backup.is_file());
+        assert_eq!(load_import_data(&backup).unwrap(), current);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn selected_import_requires_existing_file_and_backup_is_durable() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("tasks.json");
+        assert!(load_import_data(&path).is_err());
+        assert!(load_import_settings(&path).is_err());
+        fs::write(&path, b"original bytes").unwrap();
+        let backup = backup_before_import(&path, &AppData::default()).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), b"original bytes");
+        fs::write(&path, b"new bytes").unwrap();
+        let second = backup_before_import(&path, &AppData::default()).unwrap();
+        assert_ne!(backup, second);
+        assert_eq!(fs::read(backup).unwrap(), b"original bytes");
+        assert_eq!(fs::read(second).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn imported_dates_require_canonical_padding() {
+        let mut data = AppData::default();
+        data.ensure_day("2026-2-01");
+        let error = prepare_imported_data(data, "2026-11-05").unwrap_err();
+        assert!(error.contains("YYYY-MM-DD") && error.contains("2026-2-01"));
+        let mut data = AppData::default();
+        data.ensure_day("2026-02-01");
+        assert!(prepare_imported_data(data.clone(), "2026-11-05").is_ok());
+        data.recurring_tasks.push(serde_json::from_value(serde_json::json!({"id": 1, "title": "Recurring", "cycle_started_on": "2026-2-01", "available_after_days": 1, "due_after_days": 2, "created_at": "2026-02-01 00:00:00", "completed_count": 0, "picked_count": 0})).unwrap());
+        let error = prepare_imported_data(data.clone(), "2026-11-05").unwrap_err();
+        assert!(error.contains("YYYY-MM-DD") && error.contains("2026-2-01"));
+        data.recurring_tasks[0].cycle_started_on = "2026-02-01".into();
+        assert!(prepare_imported_data(data, "2026-11-05").is_ok());
+        assert!(prepare_imported_data(AppData::default(), "2026-2-01").is_err());
+    }
+
+    #[test]
     fn imported_data_rejects_duplicate_task_ids() {
         let data = AppData {
             days: vec![DayPlan {
@@ -281,6 +453,18 @@ mod tests {
             .expect_err("future data versions must be rejected");
 
         assert!(error.contains("unsupported task data version 3"));
+    }
+
+    #[test]
+    fn import_backup_accepts_a_bare_file_name() {
+        let file = NamedTempFile::new_in(".").unwrap();
+        let path = Path::new(file.path().file_name().unwrap());
+        let data = AppData::default();
+        save_data(path, &data).unwrap();
+
+        let backup = backup_before_import(path, &data).unwrap();
+        assert_eq!(load_import_data(&backup).unwrap(), data);
+        fs::remove_file(backup).unwrap();
     }
 
     #[test]

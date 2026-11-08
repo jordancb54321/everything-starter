@@ -46,6 +46,20 @@ impl WheelState {
     }
 }
 
+pub(crate) fn candidate_odds(weights: &[f64]) -> Vec<f64> {
+    let total = weights.iter().copied().filter(|w| *w > 0.0).sum::<f64>();
+    weights
+        .iter()
+        .map(|weight| {
+            if total > f64::EPSILON && *weight > 0.0 {
+                weight / total * 100.0
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn weighted_choice_index(weights: &[f64], unit_random: f64) -> usize {
     let total = weights
         .iter()
@@ -82,7 +96,7 @@ pub(crate) fn draw_wheel(
     let radius = rect.width().min(rect.height()) * 0.44;
 
     painter.circle_filled(center, radius + 8.0, Color32::from_rgb(10, 16, 26));
-    painter.circle_stroke(center, radius + 8.0, Stroke::new(1.0, border_color()));
+    painter.circle_stroke(center, radius + 8.0, Stroke::new(1.0_f32, border_color()));
 
     if entries.is_empty() {
         painter.circle_filled(center, radius, panel_alt_fill());
@@ -116,7 +130,7 @@ pub(crate) fn draw_wheel(
         };
 
         painter.circle_filled(center, radius, fill);
-        painter.circle_stroke(center, radius, Stroke::new(1.4, workspace_fill()));
+        painter.circle_stroke(center, radius, Stroke::new(1.4_f32, workspace_fill()));
         draw_centered_wheel_label(
             &painter,
             Pos2::new(center.x, center.y + radius * 0.38),
@@ -126,7 +140,7 @@ pub(crate) fn draw_wheel(
             12.0,
         );
         painter.circle_filled(center, radius * 0.18, panel_fill());
-        painter.circle_stroke(center, radius * 0.18, Stroke::new(2.0, border_color()));
+        painter.circle_stroke(center, radius * 0.18, Stroke::new(2.0_f32, border_color()));
         draw_pointer(&painter, center, radius);
         return;
     }
@@ -155,7 +169,7 @@ pub(crate) fn draw_wheel(
         painter.add(Shape::convex_polygon(
             points,
             fill,
-            Stroke::new(1.4, workspace_fill()),
+            Stroke::new(1.4_f32, workspace_fill()),
         ));
     }
 
@@ -185,7 +199,7 @@ pub(crate) fn draw_wheel(
     }
 
     painter.circle_filled(center, radius * 0.18, panel_fill());
-    painter.circle_stroke(center, radius * 0.18, Stroke::new(2.0, border_color()));
+    painter.circle_stroke(center, radius * 0.18, Stroke::new(2.0_f32, border_color()));
     draw_pointer(&painter, center, radius);
 }
 
@@ -345,22 +359,6 @@ fn rotated_vec2(vec: Vec2, angle: f32) -> Vec2 {
     Vec2::new(cos * vec.x - sin * vec.y, sin * vec.x + cos * vec.y)
 }
 
-pub(crate) fn fit_row_label(title: &str) -> String {
-    let mut chars = title.chars();
-    let mut result = String::new();
-    for _ in 0..36 {
-        let Some(ch) = chars.next() else {
-            return title.to_owned();
-        };
-        result.push(ch);
-    }
-
-    if chars.next().is_some() {
-        result.push_str("...");
-    }
-    result
-}
-
 fn lighten(color: Color32, amount: f32) -> Color32 {
     let mix = |channel: u8| -> u8 {
         let value = channel as f32 + (255.0 - channel as f32) * amount;
@@ -373,6 +371,21 @@ fn lighten(color: Color32, amount: f32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_odds_match_weighted_selection_including_empty() {
+        let odds = candidate_odds(&[1.0, 100.0, 100.0]);
+        assert!((odds[0] - 100.0 / 201.0).abs() < 1e-10);
+        assert!((odds[1] - 10000.0 / 201.0).abs() < 1e-10);
+        assert!((odds.iter().sum::<f64>() - 100.0).abs() < 1e-10);
+        assert_eq!(candidate_odds(&[5.0]), vec![100.0]);
+        assert!(candidate_odds(&[]).is_empty());
+        assert_eq!(candidate_odds(&[0.0, -1.0]), vec![0.0, 0.0]);
+        assert_eq!(
+            weighted_choice_index(&[1.0, 100.0, 100.0], odds[0] / 100.0 + 0.001),
+            1
+        );
+    }
 
     #[test]
     fn equally_due_recurring_tasks_split_their_weight_evenly() {

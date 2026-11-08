@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 const MAX_RECENT_CHORES: usize = 12;
 pub(crate) const APP_DATA_VERSION: u32 = 2;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Chore {
     pub(crate) id: u64,
     pub(crate) title: String,
@@ -14,20 +14,20 @@ pub(crate) struct Chore {
     pub(crate) picked_count: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DayPlan {
     pub(crate) date: String,
     pub(crate) chores: Vec<Chore>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RecentChore {
     pub(crate) title: String,
     pub(crate) last_added_at: String,
     pub(crate) added_count: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RecurringTask {
     pub(crate) id: u64,
     pub(crate) title: String,
@@ -40,7 +40,7 @@ pub(crate) struct RecurringTask {
     pub(crate) picked_count: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AppData {
     pub(crate) version: u32,
     pub(crate) next_id: u64,

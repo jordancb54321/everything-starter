@@ -150,9 +150,12 @@ pub(crate) fn parse_word_of_day_feed(feed: &str) -> Result<WordOfDay, String> {
         .filter(|text| !text.is_empty())
         .ok_or_else(|| format!("{WORD_OF_DAY_SOURCE} feed did not include a word."))?;
     let definition = child_text_by_name(item, "shortdef")
+        .filter(|text| !text.is_empty())
         .or_else(|| {
-            child_text_by_name(item, "summary")
-                .and_then(|summary| definition_from_summary(&summary, &word))
+            item.children()
+                .find(|node| node.is_element() && node.tag_name().name() == "summary")
+                .and_then(|node| node.text())
+                .and_then(|summary| definition_from_summary(summary, &word))
         })
         .filter(|text| !text.is_empty())
         .ok_or_else(|| format!("{WORD_OF_DAY_SOURCE} feed did not include a definition."))?;
@@ -178,8 +181,10 @@ pub(crate) fn child_text_by_name(node: roxmltree::Node<'_, '_>, name: &str) -> O
 pub(crate) fn definition_from_summary(summary: &str, word: &str) -> Option<String> {
     let word_index = summary.find(word)?;
     let after_word = summary[word_index + word.len()..].trim();
-    let definition_start = after_word.find("  ")?;
-    let after_heading = after_word[definition_start..].trim();
+    let after_heading = after_word
+        .split_once('\n')
+        .or_else(|| after_word.split_once("  "))?
+        .1;
     after_heading
         .lines()
         .map(str::trim)
@@ -378,12 +383,16 @@ pub(crate) fn required_json_f64(value: &serde_json::Value, key: &str) -> Result<
 }
 
 pub(crate) fn required_json_str_f64(value: &serde_json::Value, key: &str) -> Result<f64, String> {
-    value
+    let number = value
         .get(key)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("Location response was missing {key}."))?
         .parse::<f64>()
-        .map_err(|error| format!("Location response had invalid {key}: {error}"))
+        .map_err(|error| format!("Location response had invalid {key}: {error}"))?;
+    if !number.is_finite() {
+        return Err(format!("Location response had non-finite {key}."));
+    }
+    Ok(number)
 }
 
 pub(crate) fn optional_json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
@@ -482,6 +491,43 @@ pub(crate) fn format_precipitation(mm: f64, units: WeatherUnits) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_definition_falls_back_to_namespaced_multiline_summary() {
+        let feed = r#"<rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel><item>
+            <title>effrontery</title>
+            <itunes:summary>Merriam-Webster's Word of the Day is: effrontery  \\ih-FRUN-tuh-ree\\ noun
+Effrontery is bold shamelessness.
+
+// An example sentence.
+[See the entry]</itunes:summary>
+        </item></channel></rss>"#;
+        let word = parse_word_of_day_feed(feed).expect("summary contains a definition");
+        assert_eq!(word.word, "effrontery");
+        assert_eq!(word.definition, "Effrontery is bold shamelessness.");
+    }
+
+    #[test]
+    fn empty_short_definition_uses_summary() {
+        let feed = "<rss><channel><item><title>lucid</title><shortdef>  </shortdef>\n<summary>lucid adjective\nclear and easy to understand</summary></item></channel></rss>";
+        let word = parse_word_of_day_feed(feed).expect("empty shortdef permits fallback");
+        assert_eq!(word.definition, "clear and easy to understand");
+    }
+
+    #[test]
+    fn location_coordinates_reject_non_finite_strings() {
+        for coordinate in ["NaN", "inf", "-inf", "1e999"] {
+            let value = serde_json::json!({ "lat": coordinate });
+            assert!(
+                required_json_str_f64(&value, "lat").is_err(),
+                "accepted non-finite coordinate: {coordinate}"
+            );
+        }
+        assert_eq!(
+            required_json_str_f64(&serde_json::json!({ "lat": "51.75" }), "lat").unwrap(),
+            51.75
+        );
+    }
 
     #[test]
     fn weather_location_falls_back_when_primary_lookup_fails() {

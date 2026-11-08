@@ -15,10 +15,26 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: everything-starter-windows-x86_64
+            executable: target/release/everything-starter.exe
+          - os: ubuntu-24.04
+            artifact: everything-starter-linux-x86_64
+            executable: target/release/everything-starter
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
 
       - name: Show Rust toolchain
         run: rustup show
@@ -38,9 +54,9 @@ jobs:
       - name: Build release
         run: cargo build --locked --release --verbose
 
-      - name: Upload Windows executable
+      - name: Upload executable
         uses: actions/upload-artifact@v7
         with:
-          name: everything-starter-windows-x86_64
-          path: target/release/everything-starter.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.executable }}
           if-no-files-found: error

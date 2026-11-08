@@ -1,6 +1,167 @@
 use super::*;
 
+fn task_action(ui: &mut Ui, label: &str, action: &str, title: &str) -> egui::Response {
+    let full = format!("{action}: {title}");
+    let response = ui.button(label).on_hover_text(&full);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &full)
+    });
+    if response.has_focus() {
+        ui.label(&full);
+    }
+    response
+}
+
 impl ChoreApp {
+    pub(super) fn draw_task_editor(&mut self, ctx: &Context) {
+        let Some(edit) = &mut self.editing else {
+            return;
+        };
+        let mut cancel = false;
+        let mut save = false;
+        egui::Window::new("Edit task")
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let title_label = ui.label("Task title");
+                ui.text_edit_singleline(&mut edit.title)
+                    .labelled_by(title_label.id);
+                if matches!(edit.target, WheelTarget::Recurring(_)) {
+                    let available_label = ui.label("Available after days");
+                    ui.add(egui::DragValue::new(&mut edit.available).range(0..=3650))
+                        .labelled_by(available_label.id);
+                    let due_label = ui.label("Due after days (must be >= available)");
+                    ui.add(egui::DragValue::new(&mut edit.due).range(0..=3650))
+                        .labelled_by(due_label.id);
+                }
+                ui.horizontal(|ui| {
+                    save = ui.button("Save task edit").clicked();
+                    cancel = ui.button("Cancel edit").clicked();
+                });
+            });
+        if cancel {
+            self.editing = None;
+        } else if save {
+            let edit = self.editing.take().unwrap();
+            if !self.edit_task(edit.target, &edit.title, edit.available, edit.due) {
+                self.editing = Some(edit);
+            }
+        }
+    }
+
+    pub(super) fn draw_history(&mut self, ctx: &Context) {
+        if !self.history_open {
+            return;
+        }
+        let mut open = true;
+        let mut carry = false;
+        egui::Window::new("Daily task history").open(&mut open).vscroll(true).show(ctx, |ui| {
+            ui.label("Select unfinished tasks to bring into today. Historical records are never changed.");
+            let mut days = self.data.days.iter().filter(|day| day.date < self.today).collect::<Vec<_>>();
+            days.sort_by(|a,b| b.date.cmp(&a.date));
+            if days.is_empty() { ui.label("No prior daily task dates."); }
+            for day in days {
+                ui.collapsing(&day.date, |ui| {
+                    if day.chores.is_empty() { ui.label("No tasks on this date."); }
+                    for task in &day.chores {
+                        let mut selected = self.history_selected.contains(&task.id);
+                        let response = ui.scope(|ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            ui.add_enabled(!task.done, egui::Checkbox::new(&mut selected, &task.title))
+                        }).inner.on_hover_text(&task.title);
+                        if response.has_focus() { ui.label(&task.title); }
+                        if response.changed() {
+                            if selected { self.history_selected.insert(task.id); } else { self.history_selected.remove(&task.id); }
+                        }
+                        if task.done { ui.small(format!("Completed {}", task.completed_at.as_deref().unwrap_or("(time unavailable)"))); }
+                    }
+                });
+            }
+            carry = ui.add_enabled(!self.history_selected.is_empty(), egui::Button::new("Bring selected into today")).clicked();
+        });
+        self.history_open = open;
+        if carry {
+            let mut ids = self.history_selected.iter().copied().collect::<Vec<_>>();
+            ids.sort_unstable();
+            if self.carry_forward(&ids) {
+                self.history_selected.clear();
+            }
+        }
+    }
+
+    pub(super) fn draw_save_recovery(&mut self, ctx: &Context) {
+        TopBottomPanel::bottom("save_recovery").show(ctx, |ui| {
+            ui.label(&self.status_message);
+            if let Some(status) = &self.timer.alert_status {
+                ui.label(status);
+            }
+            if let Some(error) = &self.save_error {
+                ui.colored_label(accent_red(), error);
+            }
+            if let Some(error) = &self.settings_error {
+                ui.colored_label(accent_red(), error);
+            }
+            if self.has_unsaved_changes() && ui.button("Retry save").clicked() {
+                self.retry_save();
+            }
+        });
+        if self.close_confirmation {
+            egui::Window::new("Unsaved changes — close?").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label("Changes have not been saved. Retry saving, cancel closing, or explicitly discard unsaved changes.");
+                if ui.button("Retry save and close").clicked() {
+                    self.retry_save();
+                    if !self.has_unsaved_changes() { self.close_confirmation = false; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                }
+                if ui.button("Cancel closing").clicked() { self.close_confirmation = false; }
+                if ui.button("Discard unsaved changes and close").clicked() {
+                    self.discard_close = true;
+                    self.close_confirmation = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        }
+    }
+
+    pub(super) fn draw_import_confirmation(&mut self, ctx: &Context) {
+        let Some(pending) = &self.pending_import else {
+            return;
+        };
+        let preview = match pending {
+            PendingImport::Tasks(path, data) => format!(
+                "Replace ALL tasks and history with {}?\nImport contains {} daily dates, {} daily tasks and {} recurring tasks.\nCurrent data: {} dates and {} recurring tasks.\nA durable pre-import backup will be kept before writing. This cannot be undone.",
+                path.display(),
+                data.days.len(),
+                data.days.iter().map(|d| d.chores.len()).sum::<usize>(),
+                data.recurring_tasks.len(),
+                self.data.days.len(),
+                self.data.recurring_tasks.len()
+            ),
+            PendingImport::Layout(path, settings) => format!(
+                "Replace layout and preferences with {}?\nRecurring wheel: {}. Timer: {:?}. Weather location: {}.\nA pre-import backup will be kept before writing.",
+                path.display(),
+                settings.wheel_include_recurring,
+                settings.timer_type,
+                settings.weather_location
+            ),
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Confirm import — replaces existing data")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(preview);
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Cancel import").clicked();
+                    confirm = ui.button("Replace with imported data").clicked();
+                });
+            });
+        if cancel {
+            self.pending_import = None;
+        } else if confirm {
+            self.confirm_import();
+        }
+    }
+
     pub(super) fn draw_command_bar(&mut self, ui: &mut Ui) {
         let (total, done, remaining) = self.chore_counts();
         let mut settings_changed = false;
@@ -34,17 +195,9 @@ impl ChoreApp {
                 );
             }
 
-            if let Some(error) = self
-                .save_error
-                .as_deref()
-                .or(self.settings_error.as_deref())
-            {
-                ui.label(
-                    RichText::new("Unsaved changes")
-                        .strong()
-                        .color(accent_red()),
-                )
-                .on_hover_text(error);
+            if self.has_unsaved_changes() {
+                ui.colored_label(accent_red(), "Unsaved changes");
+                if ui.button("Retry save").clicked() { self.retry_save(); }
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -333,6 +486,19 @@ impl ChoreApp {
             "Recurring".to_owned()
         };
 
+        if ui
+            .add_enabled(
+                self.can_undo(),
+                egui::Button::new("Undo last completion / deletion"),
+            )
+            .on_hover_text("One step, this session only; later task changes invalidate Undo")
+            .clicked()
+        {
+            self.undo_task_change();
+        }
+        if ui.button("History / carry forward").clicked() {
+            self.history_open = true;
+        }
         let mut next_mode = self.task_panel_mode;
         ui.horizontal(|ui| {
             if ui
@@ -459,6 +625,7 @@ impl ChoreApp {
 
         ui.add_space(if density.tight { 8.0 } else { 14.0 });
 
+        let mut edit = None;
         let mut toggle: Option<(u64, bool)> = None;
         let mut remove: Option<u64> = None;
         {
@@ -473,61 +640,41 @@ impl ChoreApp {
                 for chore in chores {
                     let selected = selected_chore_id == Some(chore.id);
                     chore_row_frame(selected, chore.done).show(ui, |ui| {
-                        let row_width = ui.available_width();
+                        let mut done = chore.done;
+                        let title = if done {
+                            RichText::new(&chore.title)
+                                .strikethrough()
+                                .color(text_disabled())
+                        } else {
+                            RichText::new(&chore.title).color(text_primary())
+                        };
+                        let response = ui
+                            .push_id(("daily_task", chore.id), |ui| {
+                                ui.scope(|ui| {
+                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                    ui.checkbox(&mut done, title)
+                                })
+                                .inner
+                            })
+                            .inner
+                            .on_hover_text(&chore.title);
+                        if response.has_focus() {
+                            ui.label(&chore.title);
+                        }
+                        if response.changed() {
+                            toggle = Some((chore.id, done));
+                        }
+                        if chore.picked_count > 0 && !density.tight {
+                            ui.small(format!(
+                                "Picked {}",
+                                count_label(chore.picked_count, "time", "times")
+                            ));
+                        }
                         ui.horizontal(|ui| {
-                            let mut done = chore.done;
-                            if ui.checkbox(&mut done, "").changed() {
-                                toggle = Some((chore.id, done));
+                            if task_action(ui, "Edit", "Edit daily task", &chore.title).clicked() {
+                                edit = Some(chore.id);
                             }
-
-                            let title = if chore.done {
-                                RichText::new(fit_row_label(&chore.title))
-                                    .strikethrough()
-                                    .color(text_disabled())
-                            } else if selected_chore_id == Some(chore.id) {
-                                RichText::new(fit_row_label(&chore.title))
-                                    .strong()
-                                    .color(text_primary())
-                            } else {
-                                RichText::new(fit_row_label(&chore.title)).color(text_primary())
-                            };
-
-                            let remove_width = if density.tight {
-                                28.0
-                            } else if density.compact {
-                                34.0
-                            } else {
-                                76.0
-                            };
-                            let remove_label = if density.compact { "X" } else { "Remove" };
-                            let title_width = (row_width - remove_width - 42.0).clamp(0.0, 340.0);
-                            ui.vertical(|ui| {
-                                ui.add_sized(
-                                    [title_width, 20.0],
-                                    egui::Label::new(title).truncate(),
-                                );
-                                if chore.picked_count > 0 && !density.tight {
-                                    ui.add_sized(
-                                        [title_width, 16.0],
-                                        egui::Label::new(
-                                            RichText::new(format!(
-                                                "Picked {}",
-                                                count_label(chore.picked_count, "time", "times")
-                                            ))
-                                            .color(text_secondary()),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            });
-
-                            let spacer = (ui.available_width() - remove_width).max(0.0);
-                            ui.add_space(spacer);
-                            if ui
-                                .add_sized(
-                                    [remove_width, 26.0],
-                                    egui::Button::new(remove_label).fill(control_fill()),
-                                )
+                            if task_action(ui, "Remove", "Remove daily task", &chore.title)
                                 .clicked()
                             {
                                 remove = Some(chore.id);
@@ -539,6 +686,9 @@ impl ChoreApp {
             }
         }
 
+        if let Some(id) = edit {
+            self.begin_edit(WheelTarget::Daily(id));
+        }
         if let Some((id, done)) = toggle {
             self.mark_chore_done(id, done);
         }
@@ -673,11 +823,7 @@ impl ChoreApp {
                 chore_row_frame(false, already_today).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(fit_row_label(&chore.title))
-                                    .strong()
-                                    .color(text_primary()),
-                            );
+                            ui.label(RichText::new(&chore.title).strong().color(text_primary()));
                             if !density.tight {
                                 let detail = if density.compact {
                                     count_label(chore.added_count, "time", "times")
@@ -804,6 +950,7 @@ impl ChoreApp {
         ui.separator();
         ui.add_space(8.0);
 
+        let mut edit = None;
         let mut complete = None;
         let mut remove = None;
         if self.data.recurring_tasks.is_empty() {
@@ -824,13 +971,10 @@ impl ChoreApp {
                     let row_width = ui.available_width();
                     ui.add_sized(
                         [row_width, 20.0],
-                        egui::Label::new(
-                            RichText::new(fit_row_label(&task.title))
-                                .strong()
-                                .color(text_primary()),
-                        )
-                        .truncate(),
-                    );
+                        egui::Label::new(RichText::new(&task.title).strong().color(text_primary()))
+                            .truncate(),
+                    )
+                    .on_hover_text(&task.title);
                     ui.add_sized(
                         [row_width, 18.0],
                         egui::Label::new(RichText::new(status.as_str()).color(status_color))
@@ -851,32 +995,40 @@ impl ChoreApp {
                     let action_gap = ui.spacing().item_spacing.x;
                     let action_width = ((row_width - action_gap) * 0.5).max(0.0);
                     ui.horizontal(|ui| {
-                        let complete_label = if density.compact { "Done" } else { "Complete" };
+                        let complete_label = format!("Complete {}", task.title);
                         if ui
                             .add_sized(
                                 [action_width, 26.0],
                                 egui::Button::new(complete_label).fill(accent_green()),
                             )
+                            .on_hover_text(format!("Complete recurring task: {}", task.title))
                             .clicked()
                         {
                             complete = Some(task.id);
                         }
-                        let remove_label = if density.tight { "X" } else { "Remove" };
                         if ui
                             .add_sized(
                                 [action_width, 26.0],
-                                egui::Button::new(remove_label).fill(control_fill()),
+                                egui::Button::new(format!("Remove {}", task.title))
+                                    .fill(control_fill()),
                             )
+                            .on_hover_text(format!("Remove recurring task: {}", task.title))
                             .clicked()
                         {
                             remove = Some(task.id);
                         }
                     });
                 });
+                if task_action(ui, "Edit", "Edit recurring task", &task.title).clicked() {
+                    edit = Some(task.id);
+                }
                 ui.add_space(6.0);
             }
         }
 
+        if let Some(id) = edit {
+            self.begin_edit(WheelTarget::Recurring(id));
+        }
         if let Some(task_id) = complete {
             self.complete_recurring_task(task_id);
         }
@@ -962,8 +1114,7 @@ impl ChoreApp {
                 "Recurring: Off"
             };
             if ui
-                .add_enabled(
-                    self.wheel.spin.is_none(),
+                .add(
                     egui::Button::new(recurring_label).fill(if self.wheel.include_recurring {
                         accent_blue()
                     } else {
@@ -973,10 +1124,7 @@ impl ChoreApp {
                 .on_hover_text("Include currently eligible recurring tasks in wheel spins")
                 .clicked()
             {
-                self.wheel.include_recurring = !self.wheel.include_recurring;
-                if !self.wheel.include_recurring {
-                    self.selected_recurring_task_id = None;
-                }
+                self.set_wheel_include_recurring(!self.wheel.include_recurring);
                 self.save_settings_state();
             }
             if !density.tight {
@@ -995,6 +1143,24 @@ impl ChoreApp {
         ui.add_space(if density.compact { 8.0 } else { 16.0 });
 
         let entries = self.wheel_entries();
+        ui.label("Equal-sized slices are visual only. Selection is weighted: daily tasks have weight 1; recurring tasks gain weight as their deadline approaches (100 when due).");
+        if entries.is_empty() {
+            ui.label("Selection odds: no eligible tasks.");
+        } else {
+            let odds =
+                candidate_odds(&entries.iter().map(|entry| entry.weight).collect::<Vec<_>>());
+            egui::ScrollArea::vertical()
+                .id_salt("candidate_odds")
+                .max_height(110.0)
+                .show(ui, |ui| {
+                    for (entry, chance) in entries.iter().zip(odds) {
+                        ui.add(
+                            egui::Label::new(format!("{chance:.2}% — {}", entry.title)).truncate(),
+                        )
+                        .on_hover_text(entry.title);
+                    }
+                });
+        }
         let available = ui.available_size();
         let reserved_height = if density.tight {
             54.0
@@ -1145,6 +1311,9 @@ impl ChoreApp {
     }
 
     fn draw_timer_panel(&mut self, ui: &mut Ui, ctx: &Context, density: TileDensity) {
+        if let Some(status) = &self.timer.alert_status {
+            ui.label(status);
+        }
         let content_width = bounded_panel_width(ui, 390.0, 0.0);
         let type_button_width = ((content_width - 8.0) * 0.5).max(0.0);
         let mut selected_type = None;
@@ -1747,11 +1916,7 @@ impl ChoreApp {
 
         if let Some(title) = self.selected_wheel_title() {
             ui.label(RichText::new("Selected").color(text_secondary()));
-            ui.label(
-                RichText::new(fit_row_label(title))
-                    .strong()
-                    .color(text_primary()),
-            );
+            ui.label(RichText::new(title).strong().color(text_primary()));
         } else {
             ui.label(RichText::new("No task selected.").color(text_secondary()));
         }

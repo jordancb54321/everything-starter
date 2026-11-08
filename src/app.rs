@@ -18,6 +18,8 @@ use eframe::egui::{
     Rect, RichText, Sense, Stroke, TextEdit, TopBottomPanel, Ui, Vec2,
 };
 
+#[cfg(test)]
+mod tests;
 mod ui;
 
 const APP_TITLE: &str = "Everything Starter";
@@ -63,7 +65,28 @@ pub(crate) fn run() -> eframe::Result {
     )
 }
 
+enum PendingImport {
+    Tasks(PathBuf, AppData),
+    Layout(PathBuf, AppSettings),
+}
+
+struct TaskEdit {
+    target: WheelTarget,
+    title: String,
+    available: u32,
+    due: u32,
+}
+
 struct ChoreApp {
+    editing: Option<TaskEdit>,
+    pending_import: Option<PendingImport>,
+    data_dirty: bool,
+    settings_dirty: bool,
+    close_confirmation: bool,
+    discard_close: bool,
+    undo: Option<(AppData, AppData)>,
+    history_open: bool,
+    history_selected: std::collections::HashSet<u64>,
     data: AppData,
     storage_path: PathBuf,
     settings_path: PathBuf,
@@ -161,6 +184,15 @@ impl ChoreApp {
         let tiling = settings.tiling.clone().normalized();
 
         Self {
+            pending_import: None,
+            editing: None,
+            data_dirty: false,
+            settings_dirty: false,
+            close_confirmation: false,
+            discard_close: false,
+            undo: None,
+            history_open: false,
+            history_selected: Default::default(),
             data,
             storage_path,
             settings_path,
@@ -257,6 +289,62 @@ impl ChoreApp {
         true
     }
 
+    fn carry_forward(&mut self, ids: &[u64]) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        let selected = self
+            .data
+            .days
+            .iter()
+            .filter(|day| day.date < self.today)
+            .flat_map(|day| &day.chores)
+            .filter(|task| ids.contains(&task.id) && !task.done)
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.len() != ids.len() {
+            self.status_message = "Choose only unfinished historical tasks.".into();
+            return false;
+        }
+        let mut data = self.data.clone();
+        for old in selected {
+            let title = normalize_title(&old.title);
+            if title.is_empty()
+                || data
+                    .today(&self.today)
+                    .unwrap()
+                    .chores
+                    .iter()
+                    .any(|task| same_chore_title(&task.title, &title))
+            {
+                self.status_message =
+                    format!("Nothing carried forward: empty or duplicate title: {title}");
+                return false;
+            }
+            let Some(id) = data.take_next_id() else {
+                self.status_message = "Nothing carried forward: task ID range exhausted.".into();
+                return false;
+            };
+            data.today_mut(&self.today).chores.push(Chore {
+                id,
+                title: title.clone(),
+                done: false,
+                created_at: timestamp_string(),
+                completed_at: None,
+                picked_count: 0,
+            });
+            data.remember_chore(&title);
+        }
+        self.cancel_spin_for_chore_change();
+        self.data = data;
+        self.status_message = format!(
+            "Brought {} unfinished tasks into today; history retained.",
+            ids.len()
+        );
+        self.save();
+        true
+    }
+
     fn clear_recent_chores(&mut self) {
         if self.data.recent_chores.is_empty() {
             return;
@@ -268,6 +356,7 @@ impl ChoreApp {
     }
 
     fn save(&mut self) {
+        self.data_dirty = true;
         if !self.data_save_enabled {
             if self.save_error.is_none() {
                 self.save_error = Some(
@@ -279,8 +368,33 @@ impl ChoreApp {
         }
 
         match save_data(&self.storage_path, &self.data) {
-            Ok(()) => self.save_error = None,
+            Ok(()) => {
+                self.save_error = None;
+                self.data_dirty = false;
+            }
             Err(error) => self.save_error = Some(error.to_string()),
+        }
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.data_dirty || self.settings_dirty || self.dashboard.layout_dirty
+    }
+
+    fn retry_save(&mut self) {
+        if self.data_dirty {
+            self.save();
+        }
+        if self.settings_dirty || self.dashboard.layout_dirty {
+            self.save_settings_state();
+            self.dashboard.layout_dirty = false;
+        }
+    }
+
+    fn guard_close(&mut self, ctx: &Context, requested: bool) {
+        if requested && self.has_unsaved_changes() && !self.discard_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_confirmation = true;
+            ctx.request_repaint();
         }
     }
 
@@ -302,6 +416,7 @@ impl ChoreApp {
     }
 
     fn save_settings_state(&mut self) {
+        self.settings_dirty = true;
         if !self.settings_save_enabled {
             if self.settings_error.is_none() {
                 self.settings_error = Some(
@@ -313,7 +428,10 @@ impl ChoreApp {
         }
 
         match save_settings(&self.settings_path, &self.current_settings()) {
-            Ok(()) => self.settings_error = None,
+            Ok(()) => {
+                self.settings_error = None;
+                self.settings_dirty = false;
+            }
             Err(error) => self.settings_error = Some(error.to_string()),
         }
     }
@@ -395,6 +513,23 @@ impl ChoreApp {
     }
 
     fn advance_timer(&mut self, ctx: &Context) {
+        if let Some(receiver) = &self.timer.alert_receiver {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.timer.alert_status = Some(match result {
+                        Ok(()) => "Completion alert delivered to system tools.".into(),
+                        Err(error) => error,
+                    });
+                    self.timer.alert_receiver = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.timer.alert_status =
+                        Some("Completion alert worker ended without a result.".into());
+                    self.timer.alert_receiver = None;
+                }
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(200)),
+            }
+        }
         match self.timer.timer_type {
             TimerType::Pomodoro => self.advance_pomodoro(ctx),
             TimerType::Countdown => self.advance_countdown(ctx),
@@ -445,7 +580,8 @@ impl ChoreApp {
                 }
             }
             if self.timer.chime_enabled {
-                play_system_chime();
+                self.timer.alert_status = Some("Sending completion alert…".into());
+                self.timer.alert_receiver = Some(spawn_timer_alert(self.status_message.clone()));
             }
             ctx.request_repaint();
         } else {
@@ -501,7 +637,8 @@ impl ChoreApp {
             self.timer.countdown_complete = true;
             self.status_message = "Timer complete.".to_owned();
             if self.timer.chime_enabled {
-                play_system_chime();
+                self.timer.alert_status = Some("Sending completion alert…".into());
+                self.timer.alert_receiver = Some(spawn_timer_alert(self.status_message.clone()));
             }
             ctx.request_repaint();
         } else {
@@ -544,6 +681,15 @@ impl ChoreApp {
         if self.today != current_day {
             self.today = current_day;
             self.data.ensure_day(&self.today);
+            // Daily edits target today's list, not the historical day just closed.
+            if self
+                .editing
+                .as_ref()
+                .is_some_and(|edit| matches!(edit.target, WheelTarget::Daily(_)))
+            {
+                self.editing = None;
+            }
+            self.undo = None;
             self.selected_chore_id = None;
             self.selected_recurring_task_id = None;
             self.wheel.spin = None;
@@ -553,6 +699,15 @@ impl ChoreApp {
                 self.request_weather();
             }
             self.save();
+        }
+    }
+
+    fn set_wheel_include_recurring(&mut self, include: bool) {
+        if self.wheel.include_recurring != include {
+            self.wheel.spin = None;
+            self.selected_chore_id = None;
+            self.selected_recurring_task_id = None;
+            self.wheel.include_recurring = include;
         }
     }
 
@@ -703,7 +858,125 @@ impl ChoreApp {
         }
     }
 
+    fn begin_edit(&mut self, target: WheelTarget) {
+        self.editing = match target {
+            WheelTarget::Daily(id) => {
+                self.today_plan()
+                    .chores
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|task| TaskEdit {
+                        target,
+                        title: task.title.clone(),
+                        available: 0,
+                        due: 0,
+                    })
+            }
+            WheelTarget::Recurring(id) => self
+                .data
+                .recurring_tasks
+                .iter()
+                .find(|t| t.id == id)
+                .map(|task| TaskEdit {
+                    target,
+                    title: task.title.clone(),
+                    available: task.available_after_days,
+                    due: task.due_after_days,
+                }),
+        };
+    }
+
+    fn edit_task(&mut self, target: WheelTarget, title: &str, available: u32, due: u32) -> bool {
+        let title = normalize_title(title);
+        let duplicate = match target {
+            WheelTarget::Daily(id) => self
+                .today_plan()
+                .chores
+                .iter()
+                .any(|task| task.id != id && same_chore_title(&task.title, &title)),
+            WheelTarget::Recurring(id) => self
+                .data
+                .recurring_tasks
+                .iter()
+                .any(|task| task.id != id && same_chore_title(&task.title, &title)),
+        };
+        if title.is_empty()
+            || duplicate
+            || (matches!(target, WheelTarget::Recurring(_)) && due < available)
+        {
+            self.status_message =
+                "Edit not saved: enter a nonempty, unique title and due days >= available days."
+                    .into();
+            return false;
+        }
+        match target {
+            WheelTarget::Daily(id) => {
+                let Some(task) = self
+                    .today_plan_mut()
+                    .chores
+                    .iter_mut()
+                    .find(|task| task.id == id)
+                else {
+                    return false;
+                };
+                task.title = title;
+            }
+            WheelTarget::Recurring(id) => {
+                let Some(task) = self
+                    .data
+                    .recurring_tasks
+                    .iter_mut()
+                    .find(|task| task.id == id)
+                else {
+                    return false;
+                };
+                task.title = title;
+                task.available_after_days = available;
+                task.due_after_days = due;
+                if self.selected_recurring_task_id == Some(id)
+                    && !recurring_schedule(task, &self.today).eligible
+                {
+                    self.selected_recurring_task_id = None;
+                }
+            }
+        }
+        self.cancel_spin_for_chore_change();
+        self.status_message = "Task updated; identity and completion history retained.".into();
+        self.save();
+        true
+    }
+
+    fn remember_undo(&mut self, before: AppData) {
+        if before != self.data {
+            self.undo = Some((before, self.data.clone()));
+        }
+    }
+
+    fn can_undo(&self) -> bool {
+        self.undo
+            .as_ref()
+            .is_some_and(|(_, after)| *after == self.data)
+    }
+
+    fn undo_task_change(&mut self) {
+        if let Some((before, after)) = self.undo.take() {
+            if after != self.data {
+                self.status_message =
+                    "Undo is no longer available after another task change.".into();
+                return;
+            }
+            self.data = before;
+            self.wheel.spin = None;
+            self.selected_chore_id = None;
+            self.selected_recurring_task_id = None;
+            self.status_message =
+                "Last task completion or deletion undone (this session only).".into();
+            self.save();
+        }
+    }
+
     fn mark_chore_done(&mut self, chore_id: u64, done: bool) {
+        let before = self.data.clone();
         self.cancel_spin_for_chore_change();
         let was_selected = self.selected_chore_id == Some(chore_id);
         let mut changed_title = None;
@@ -730,10 +1003,12 @@ impl ChoreApp {
             }
         }
 
+        self.remember_undo(before);
         self.save();
     }
 
     fn remove_chore(&mut self, chore_id: u64) {
+        let before = self.data.clone();
         self.cancel_spin_for_chore_change();
         let day = self.today_plan_mut();
         day.chores.retain(|chore| chore.id != chore_id);
@@ -743,13 +1018,16 @@ impl ChoreApp {
         }
 
         self.status_message = "Task removed.".to_owned();
+        self.remember_undo(before);
         self.save();
     }
 
     fn clear_finished(&mut self) {
+        let before = self.data.clone();
         self.cancel_spin_for_chore_change();
         self.today_plan_mut().chores.retain(|chore| !chore.done);
         self.status_message = "Finished tasks cleared from today.".to_owned();
+        self.remember_undo(before);
         self.save();
     }
 
@@ -800,6 +1078,7 @@ impl ChoreApp {
     }
 
     fn complete_recurring_task(&mut self, task_id: u64) {
+        let before = self.data.clone();
         self.cancel_spin_for_chore_change();
         let completed_at = timestamp_string();
         let mut completed_title = None;
@@ -820,17 +1099,20 @@ impl ChoreApp {
                 self.selected_recurring_task_id = None;
             }
             self.status_message = format!("Completed recurring task: {title}");
+            self.remember_undo(before);
             self.save();
         }
     }
 
     fn remove_recurring_task(&mut self, task_id: u64) {
+        let before = self.data.clone();
         self.cancel_spin_for_chore_change();
         self.data.recurring_tasks.retain(|task| task.id != task_id);
         if self.selected_recurring_task_id == Some(task_id) {
             self.selected_recurring_task_id = None;
         }
         self.status_message = "Recurring task removed.".to_owned();
+        self.remember_undo(before);
         self.save();
     }
 
@@ -855,48 +1137,84 @@ impl ChoreApp {
                 self.status_message = format!("Tasks exported to {}.", path_label(&path));
             }
             Err(error) => {
-                self.save_error = Some(format!(
-                    "Could not export tasks to {}: {error}",
-                    path.display()
-                ));
+                self.status_message =
+                    format!("Could not export tasks to {}: {error}", path.display());
             }
         }
     }
 
     fn import_tasks(&mut self) {
-        let Some(path) = open_json_dialog("Import Tasks", self.storage_path.parent()) else {
+        if let Some(path) = open_json_dialog("Import Tasks", self.storage_path.parent()) {
+            self.stage_task_import(&path);
+        }
+    }
+
+    fn stage_task_import(&mut self, path: &std::path::Path) {
+        self.pending_import = None;
+        match load_import_data(path)
+            .map_err(|e| e.to_string())
+            .and_then(|data| prepare_imported_data(data, &self.today))
+        {
+            Ok(data) => self.pending_import = Some(PendingImport::Tasks(path.to_owned(), data)),
+            Err(error) => self.status_message = format!("Could not import tasks: {error}"),
+        }
+    }
+
+    fn confirm_import(&mut self) {
+        let Some(pending) = self.pending_import.take() else {
             return;
         };
-
-        match load_data(&path) {
-            Ok(data) => match prepare_imported_data(data, &self.today) {
-                Ok(data) => {
-                    self.data = data;
-                    self.data_save_enabled = true;
-                    self.selected_chore_id = None;
-                    self.selected_recurring_task_id = None;
-                    self.wheel.spin = None;
-                    self.wheel.rotation = 0.0;
-                    self.save();
-
-                    if self.save_error.is_none() {
-                        self.status_message = format!("Tasks imported from {}.", path_label(&path));
-                    } else {
-                        self.status_message = "Tasks imported, but saving them failed.".to_owned();
+        match pending {
+            PendingImport::Tasks(path, data) => {
+                let data = match prepare_imported_data(data, &self.today) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        self.status_message =
+                            format!("Import canceled; original tasks retained: {error}");
+                        return;
                     }
+                };
+                if let Err(error) = backup_before_import(&self.storage_path, &self.data)
+                    .and_then(|_| save_data(&self.storage_path, &data))
+                {
+                    self.status_message =
+                        format!("Import canceled; original tasks retained: {error}");
+                    return;
                 }
-                Err(error) => {
-                    self.save_error = Some(format!(
-                        "Could not import tasks from {}: {error}",
-                        path.display()
-                    ));
+                self.editing = None;
+                self.undo = None;
+                self.history_selected.clear();
+                self.data = data;
+                self.data_dirty = false;
+                self.data_save_enabled = true;
+                self.save_error = None;
+                self.selected_chore_id = None;
+                self.selected_recurring_task_id = None;
+                self.wheel.spin = None;
+                self.wheel.rotation = 0.0;
+                self.status_message = format!(
+                    "Tasks imported from {}. Pre-import file backed up.",
+                    path_label(&path)
+                );
+            }
+            PendingImport::Layout(path, settings) => {
+                if let Err(error) =
+                    backup_before_import(&self.settings_path, &self.current_settings())
+                        .and_then(|_| save_settings(&self.settings_path, &settings))
+                {
+                    self.status_message =
+                        format!("Import canceled; original layout retained: {error}");
+                    return;
                 }
-            },
-            Err(error) => {
-                self.save_error = Some(format!(
-                    "Could not import tasks from {}: {error}",
-                    path.display()
-                ));
+                self.apply_imported_layout(settings);
+                self.settings_dirty = false;
+                self.settings_save_enabled = true;
+                self.settings_error = None;
+                self.request_weather();
+                self.status_message = format!(
+                    "Layout imported from {}. Pre-import file backed up.",
+                    path_label(&path)
+                );
             }
         }
     }
@@ -915,69 +1233,56 @@ impl ChoreApp {
                 self.status_message = format!("Layout exported to {}.", path_label(&path));
             }
             Err(error) => {
-                self.settings_error = Some(format!(
-                    "Could not export layout to {}: {error}",
-                    path.display()
-                ));
+                self.status_message =
+                    format!("Could not export layout to {}: {error}", path.display());
             }
         }
     }
 
     fn import_layout(&mut self) {
-        let Some(path) = open_json_dialog("Import Layout", self.settings_path.parent()) else {
-            return;
-        };
-
-        match load_settings(&path) {
-            Ok(settings) => {
-                self.settings_save_enabled = true;
-                let mut windows = settings.windows;
-                let mut layout: DashboardLayout = settings.layout.into();
-                self.task_panel_mode = merge_legacy_recurring_window(
-                    &mut windows,
-                    &mut layout,
-                    settings.task_panel_mode,
-                );
-                self.dashboard.tiling = settings.tiling.normalized();
-                self.dashboard.tile_interaction = None;
-                self.dashboard.tiling_dirty = true;
-                self.dashboard.tiled_workspace = None;
-                self.dashboard.windows = windows;
-                self.dashboard.layout = layout;
-                self.dashboard.layout.request_sizes_once();
-                self.dashboard.layout_dirty = false;
-                self.dashboard.snap_to_grid = settings.snap_to_grid;
-                self.dashboard.windows_locked = settings.windows_locked;
-                self.timer.timer_type = settings.timer_type;
-                self.timer.countdown_duration_seconds = settings
-                    .countdown_duration_seconds
-                    .clamp(1, MAX_COUNTDOWN_MINUTES * 60 + 59);
-                self.reset_countdown();
-                self.timer.chime_enabled = settings.timer_chime_enabled;
-                self.wheel.include_recurring = settings.wheel_include_recurring;
-                self.weather.location_input = settings.weather_location;
-                self.weather.units = settings.weather_units;
-                if self.weather.location_input.trim().is_empty() {
-                    self.weather.state = WeatherState::Idle;
-                    self.weather.receiver = None;
-                    self.weather.requested_location.clear();
-                } else {
-                    self.request_weather();
-                }
-                self.save_settings_state();
-
-                if self.settings_error.is_none() {
-                    self.status_message = format!("Layout imported from {}.", path_label(&path));
-                } else {
-                    self.status_message = "Layout imported, but saving it failed.".to_owned();
-                }
+        if let Some(path) = open_json_dialog("Import Layout", self.settings_path.parent()) {
+            self.pending_import = None;
+            match load_import_settings(&path) {
+                Ok(settings) => self.pending_import = Some(PendingImport::Layout(path, settings)),
+                Err(error) => self.status_message = format!("Could not import layout: {error}"),
             }
-            Err(error) => {
-                self.settings_error = Some(format!(
-                    "Could not import layout from {}: {error}",
-                    path.display()
-                ));
-            }
+        }
+    }
+
+    fn apply_imported_layout(&mut self, settings: AppSettings) {
+        self.wheel.spin = None;
+        self.selected_chore_id = None;
+        self.selected_recurring_task_id = None;
+        let mut windows = settings.windows;
+        let mut layout: DashboardLayout = settings.layout.into();
+        self.task_panel_mode =
+            merge_legacy_recurring_window(&mut windows, &mut layout, settings.task_panel_mode);
+        self.dashboard.tiling = settings.tiling.normalized();
+        self.dashboard.tile_interaction = None;
+        self.dashboard.tiling_dirty = true;
+        self.dashboard.tiled_workspace = None;
+        self.dashboard.windows = windows;
+        self.dashboard.layout = layout;
+        self.dashboard.layout.request_sizes_once();
+        self.dashboard.layout_dirty = false;
+        self.dashboard.snap_to_grid = settings.snap_to_grid;
+        self.dashboard.windows_locked = settings.windows_locked;
+        self.timer.timer_type = settings.timer_type;
+        // Imported preferences must not leave a hidden timer running.
+        self.timer.pomodoro_running = false;
+        self.timer.pomodoro_last_tick = None;
+        self.timer.countdown_duration_seconds = settings
+            .countdown_duration_seconds
+            .clamp(1, MAX_COUNTDOWN_MINUTES * 60 + 59);
+        self.reset_countdown();
+        self.timer.chime_enabled = settings.timer_chime_enabled;
+        self.set_wheel_include_recurring(settings.wheel_include_recurring);
+        self.weather.location_input = settings.weather_location;
+        self.weather.units = settings.weather_units;
+        self.weather.state = WeatherState::Idle;
+        self.weather.receiver = None;
+        if self.weather.location_input.trim().is_empty() {
+            self.weather.requested_location.clear();
         }
     }
 
@@ -1162,7 +1467,7 @@ impl ChoreApp {
         painter.rect_stroke(
             rect,
             8.0,
-            Stroke::new(2.0, Color32::from_rgba_unmultiplied(52, 211, 153, 220)),
+            Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(52, 211, 153, 220)),
         );
     }
 }
@@ -1183,6 +1488,9 @@ impl eframe::App for ChoreApp {
                 self.draw_command_bar(ui);
             });
 
+        self.guard_close(ctx, ctx.input(|input| input.viewport().close_requested()));
+        self.draw_save_recovery(ctx);
+
         CentralPanel::default()
             .frame(egui::Frame::none().fill(workspace_fill()))
             .show(ctx, |ui| {
@@ -1191,6 +1499,10 @@ impl eframe::App for ChoreApp {
             });
 
         self.show_dashboard_windows(ctx);
+        self.draw_task_editor(ctx);
+        self.draw_history(ctx);
+        self.draw_import_confirmation(ctx);
+        self.guard_close(ctx, ctx.input(|input| input.viewport().close_requested()));
     }
 }
 

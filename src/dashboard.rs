@@ -675,6 +675,7 @@ pub(crate) fn resized_tile_weight(start_weight: f32, start_rect: Rect, resized_r
 }
 
 pub(crate) fn split_columns(rect: Rect, left_fraction: f32, gap: f32) -> (Rect, Rect) {
+    let gap = gap.clamp(0.0, rect.width().max(0.0));
     let usable_width = (rect.width() - gap).max(0.0);
     let left_width = usable_width * left_fraction.clamp(0.1, 0.9);
     let left = Rect::from_min_max(rect.min, Pos2::new(rect.left() + left_width, rect.bottom()));
@@ -683,6 +684,7 @@ pub(crate) fn split_columns(rect: Rect, left_fraction: f32, gap: f32) -> (Rect, 
 }
 
 pub(crate) fn split_rows(rect: Rect, top_fraction: f32, gap: f32) -> (Rect, Rect) {
+    let gap = gap.clamp(0.0, rect.height().max(0.0));
     let usable_height = (rect.height() - gap).max(0.0);
     let top_height = usable_height * top_fraction.clamp(0.1, 0.9);
     let top = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.top() + top_height));
@@ -696,30 +698,30 @@ pub(crate) fn configure_dark_style(ctx: &Context) {
     style.visuals.override_text_color = Some(text_primary());
     style.visuals.panel_fill = workspace_fill();
     style.visuals.window_fill = panel_fill();
-    style.visuals.window_stroke = Stroke::new(1.0, border_color());
+    style.visuals.window_stroke = Stroke::new(1.0_f32, border_color());
     style.visuals.faint_bg_color = panel_alt_fill();
     style.visuals.extreme_bg_color = workspace_fill();
     style.visuals.selection.bg_fill = accent_blue();
-    style.visuals.selection.stroke = Stroke::new(1.0, text_primary());
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, text_primary());
     style.visuals.widgets.noninteractive.bg_fill = panel_alt_fill();
     style.visuals.widgets.noninteractive.weak_bg_fill = panel_alt_fill();
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border_color());
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_secondary());
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border_color());
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, text_secondary());
     style.visuals.widgets.inactive.bg_fill = control_fill();
     style.visuals.widgets.inactive.weak_bg_fill = control_fill();
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border_color());
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_primary());
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, border_color());
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, text_primary());
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(42, 58, 82);
     style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(42, 58, 82);
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(73, 96, 129));
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(73, 96, 129));
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     style.visuals.widgets.active.bg_fill = accent_blue();
     style.visuals.widgets.active.weak_bg_fill = accent_blue();
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(147, 197, 253));
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(147, 197, 253));
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     style.visuals.widgets.open.bg_fill = panel_alt_fill();
     style.visuals.widgets.open.weak_bg_fill = panel_alt_fill();
-    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(73, 96, 129));
+    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(73, 96, 129));
     style.visuals.window_rounding = Rounding::same(10.0);
     style.visuals.menu_rounding = Rounding::same(8.0);
     style.visuals.window_shadow = Shadow {
@@ -829,11 +831,11 @@ pub(crate) fn draw_snap_preview(ctx: &Context, rect: Rect, resizing: bool) {
     painter.rect_stroke(
         preview_rect,
         10.0,
-        Stroke::new(1.5, Color32::from_rgba_unmultiplied(96, 165, 250, 190)),
+        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(96, 165, 250, 190)),
     );
     painter.line_segment(
         [rect.center(), preview_rect.center()],
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(96, 165, 250, 120)),
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(96, 165, 250, 120)),
     );
 }
 
@@ -940,7 +942,7 @@ pub(crate) fn rect_nearly_equal(left: Rect, right: Rect) -> bool {
 pub(crate) fn dashboard_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(panel_fill())
-        .stroke(Stroke::new(1.0, border_color()))
+        .stroke(Stroke::new(1.0_f32, border_color()))
         .rounding(10.0)
         .shadow(Shadow {
             offset: Vec2::new(0.0, 2.0),
@@ -962,7 +964,7 @@ pub(crate) fn chore_row_frame(selected: bool, subdued: bool) -> egui::Frame {
 
     egui::Frame::none()
         .fill(fill)
-        .stroke(Stroke::new(1.0, border_color()))
+        .stroke(Stroke::new(1.0_f32, border_color()))
         .rounding(8.0)
         .inner_margin(Margin::symmetric(10.0, 8.0))
 }
@@ -970,7 +972,7 @@ pub(crate) fn chore_row_frame(selected: bool, subdued: bool) -> egui::Frame {
 pub(crate) fn empty_panel(ui: &mut Ui, text: &str) {
     egui::Frame::none()
         .fill(panel_alt_fill())
-        .stroke(Stroke::new(1.0, border_color()))
+        .stroke(Stroke::new(1.0_f32, border_color()))
         .rounding(8.0)
         .inner_margin(Margin::same(14.0))
         .show(ui, |ui| {
@@ -1085,6 +1087,20 @@ mod tests {
         assert_eq!(mode, TaskPanelMode::Recurring);
         assert_eq!(layout.chores.position, Pos2::new(180.0, 220.0));
         assert_eq!(layout.chores.size, Vec2::new(460.0, 390.0));
+    }
+
+    #[test]
+    fn tiny_workspaces_keep_tiles_bounded_with_nonnegative_sizes() {
+        let tiling = TilingSettings::default();
+        for size in [Vec2::new(5.0, 2.0), Vec2::new(2.0, 5.0), Vec2::ZERO] {
+            let workspace = Rect::from_min_size(Pos2::ZERO, size);
+            let rects = dashboard_tiling_rects(workspace, &DashboardWindowKind::ALL, &tiling);
+            assert_eq!(rects.len(), DashboardWindowKind::ALL.len());
+            for rect in rects {
+                assert!(rect.width() >= 0.0 && rect.height() >= 0.0, "{rect:?}");
+                assert!(workspace.contains_rect(rect), "{workspace:?}: {rect:?}");
+            }
+        }
     }
 
     #[test]
