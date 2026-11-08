@@ -23,6 +23,7 @@ This entry includes the local work that was already in progress when the review 
 - Kept tiled rectangles inside very small workspaces and rejected non-finite weather coordinates.
 - Updated the locked TLS, trust-store, browser, event-listener, clipboard, executor, and Wayland scanner dependencies. Remaining indirect dependency advisories are listed in `docs/REVIEW.md`.
 - Rewrote the README, added the project history and code map, and documented the review's limits. Comments explain the awkward behavior rather than narrate each line.
+- Closed the backup test's temporary-file handle before replacement; the first Windows CI run caught the fixture holding it open.
 
 ## 2026-07-13
 

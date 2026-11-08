@@ -61,6 +61,8 @@ cargo build --locked --release               passed
 
 The baseline before this review had 55 passing tests. The six added regressions cover the fixes above. Tests use synthetic data and temporary directories, including egui control tests. The release executable is `target/release/everything-starter`.
 
+The first hosted run, `42470374777`, passed Ubuntu but caught a Windows-only fixture mistake: the bare-filename backup test held a temporary-file handle open while trying to replace that same file. The test now closes the handle first and retains only its cleanup path. No production behavior was changed for that correction. The current hosted result is recorded in GitHub Actions rather than inferred from the Linux checks.
+
 This session had no Wayland or X11 display, so it did not perform a native visual walkthrough, exercise native file dialogs, hear timer sounds, or test a physical screen reader. Live weather and dictionary endpoints were not exercised in this review. Older native/live checks recorded in `tests/IMPROVEMENTS_TEST_EVIDENCE.md` are historical notes, not new evidence from this session. Windows execution is left to hosted CI; even a successful Windows build is not an interactive Windows desktop test.
 
 Run the development checks from the README after any follow-up. For dependencies, install `cargo-audit` and run `cargo audit`; it currently exits nonzero for the remaining XML advisories. A passing build does not make that scan clean.

@@ -457,8 +457,9 @@ mod tests {
 
     #[test]
     fn import_backup_accepts_a_bare_file_name() {
-        let file = NamedTempFile::new_in(".").unwrap();
-        let path = Path::new(file.path().file_name().unwrap());
+        // Windows won't replace a destination while this fixture holds its handle open.
+        let file = NamedTempFile::new_in(".").unwrap().into_temp_path();
+        let path = Path::new(file.file_name().unwrap());
         let data = AppData::default();
         save_data(path, &data).unwrap();
 
